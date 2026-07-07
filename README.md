@@ -14,7 +14,7 @@ AdaMCF targets the two coupled decisions in structured pruning:
 The method is designed for practical structured compression across CNNs, vision
 Transformers, object detectors, and pretrained language models.
 
-> 🔗 **Links:** [🤗 Hugging Face Model Hub](https://huggingface.co/AXAIIT/AdaMCF)
+> 🔗 **Links:** [🤗 Hugging Face — Model Weights](https://huggingface.co/AXAIIT/AdaMCF)
 
 ![AdaMCF pruning overview](images/AdaMCF_Pruning.jpg)
 
