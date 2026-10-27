@@ -9,6 +9,7 @@ from functools import partial
 import gc
 import json
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -28,6 +29,7 @@ from phi2_structure import (build_param_groups, collect_pruning_plan,
 
 @dataclass
 class PruningConfig:
+    pruning_mode: str = 'joint'
     seed: int = 42
     batch_size: int = 1
     learning_rate: float = 0.0001
@@ -187,11 +189,12 @@ def run(args):
               'weights': {p.name: file_sha256(p) for p in sorted(args.model_dir.glob('*.safetensors'))},
               'config': asdict(config), 'device': str(device), 'dtype': str(next(model.parameters()).dtype),
               'torch': torch.__version__, 'gpu': torch.cuda.get_device_name(device) if device.type == 'cuda' else None,
+              'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
               'code_sha256': {p.name: file_sha256(p) for p in HERE.glob('*.py')}}
     write_json(args.output / 'inputs.json', inputs)
     before_count = parameter_count(model)
     baseline = evaluate_response_loss(model, loaders['eval'], device)
-    groups = build_param_groups(model)
+    groups = build_param_groups(model, config.pruning_mode)
     write_json(args.output / 'parameter_groups.json', group_summary(groups))
     optimizer = HESSOCRIC(
         groups, variant=config.optimizer_variant, lr=config.learning_rate,
@@ -202,6 +205,7 @@ def run(args):
         hybrid_training_steps=config.hybrid_training_steps,
         adaptive_alpha=config.adaptive_alpha,
         alpha_scheduler_cfg={'warmup_updates': 0, 'eval_batch_limit': config.alpha_eval_batches})
+    optimizer.phi_pruning_mode = config.pruning_mode
     print(json.dumps({'stage': 'loaded', 'parameters': before_count,
                       'prunable_parameter_groups': len(optimizer.prunable_param_group_dict),
                       'logical_groups': optimizer.total_num_groups,
@@ -223,8 +227,28 @@ def run(args):
     plan['parameters_before'] = before_count
     plan['pruned_logical_groups'] = sum(len(entry[kind]['pruned'])
                                        for entry in plan['layers'] for kind in ('ffn', 'attention'))
+    plan['pruned_logical_groups'] += sum(len(e['head_dim_pruned_units']) for e in plan['layers'])
     plan['alpha_final'] = optimizer.alpha_scheduler.alpha.detach().cpu().tolist()
     plan['alpha_updates'] = optimizer.alpha_scheduler.update_count
+    counts = {
+        'pruned_ffn_neurons': sum(len(e['ffn']['pruned']) for e in plan['layers']),
+        'pruned_attention_heads': sum(len(e['attention']['pruned']) for e in plan['layers']),
+        'pruned_head_dim_units': sum(len(e['head_dim_pruned_units']) for e in plan['layers']),
+        'pruned_head_dimensions_per_head_sum': sum(len(e['head_dim_pruned']) for e in plan['layers']),
+        'pruned_attention_channels': sum(
+            e['attention']['original'] * e['head_dim']
+            - len(e['attention']['keep']) * len(e['head_dim_keep']) for e in plan['layers']),
+        'candidate_logical_groups': optimizer.total_num_groups,
+        'candidate_parameter_groups': len(optimizer.prunable_param_group_dict),
+    }
+    expected = {'ffn': 'pruned_ffn_neurons', 'num_head': 'pruned_attention_heads',
+                'head_dim': 'pruned_head_dim_units'}
+    if config.pruning_mode in expected:
+        if counts[expected[config.pruning_mode]] <= 0:
+            raise AssertionError('指定模式没有产生真实 CRIC 删除结果。')
+        for mode, key in expected.items():
+            if mode != config.pruning_mode and counts[key] != 0:
+                raise AssertionError('指定模式误删了其他类型结构。')
     sparse_eval = evaluate_response_loss(model, loaders['eval'], device)
     probe = to_device(next(iter(loaders['eval'])), device)
     probe = {k: v[:1] for k, v in probe.items()}
@@ -245,11 +269,11 @@ def run(args):
                 'sparse_logits': sparse_logits.cpu(), 'atol': config.equivalence_atol,
                 'rtol': config.equivalence_rtol}, args.output / 'sparse_probe.pt')
     context = {'full_benchmark_evaluated': False,
+              'pruning_mode': config.pruning_mode,
               'parameters_before': before_count,
               'target_logical_group_sparsity': config.target_group_sparsity,
               'pruned_logical_groups': plan['pruned_logical_groups'],
-              'pruned_ffn_neurons': sum(len(e['ffn']['pruned']) for e in plan['layers']),
-              'pruned_attention_heads': sum(len(e['attention']['pruned']) for e in plan['layers']),
+              **counts,
               'alpha_final': plan['alpha_final'], 'alpha_updates': plan['alpha_updates'],
               'final_training_step': final_step, 'baseline_eval': baseline, 'sparse_eval': sparse_eval,
               'training_memory': memory_stats(device)}

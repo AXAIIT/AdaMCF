@@ -33,6 +33,7 @@ pretrain_phi2/
 | `prepare_phi2_data.py` | 固定互斥 train/alpha/eval 原始行索引，分词，保存 JSONL 与摘要 |
 | `phi2_data.py` | 校验和读取冻结数据、padding、生成模型输入 |
 | `phi2_structure.py` | 原生 Phi 参数组、物理压缩、异构逐层宽度的保存与重建 |
+| `phi2_attention.py` | head_dim 局部适配，保持 RoPE 配对、频率和原 attention scaling |
 | `phi2_precision.py` | 原生 FP32 漂移记录和严格 FP64 结构对照，诊断后恢复原生实现 |
 | `export_phi2_pruned.py` | 从已保存的稀疏检查点独立物理导出，无需重跑训练 |
 | `prune_phi2_hesso_cric.py` | 加载真实权重，运行完整 CRIC，检查零组，导出与对齐输出 |
@@ -54,13 +55,27 @@ pretrain_phi2/
 ## 结构剪枝范围
 
 - FFN：联动 `fc1.weight` 的行、`fc1.bias` 与 `fc2.weight` 的列。
-- 注意力：联动 Q/K/V 的完整头行、对应 bias 和 `dense.weight` 的输入列；保留每头宽度和 RoPE 配对关系。
+- num_head：联动 Q/K/V 的完整头行、对应 bias 和 dense 输入列，保留每头宽度。
+- head_dim：同步压缩每个头的相同维度；每个逻辑单位为两维，旋转区按真实 RoPE 配对，非旋转区按相邻两维配对。保留原位置频率与 attention scaling，不按新 head_dim 重算。
 - residual hidden size、embedding、LayerNorm、词表维度不做结构剪枝；这些参数与输出 bias 仍可训练。
 - 所有参数恰好归属一次。拒绝 GQA、量化 Linear、空保留组及非法结构索引。
 
 本地适配器按原生模块和实际宽度构造显式依赖合同，再调用已有 HESSOCRIC；它不使用面向旧 PhiMHA 的公共图算子。因此本次不代表通用图追踪器已支持任意 Phi 实现。公共 HESSO、CRIC 与既有模型算子没有为此修改。
 
-五准则、自适应 α、周期内冻结和最终历史重融合使用此前已适配的 CRIC。32 层 Phi-2 有 64 个可剪枝参数组，初始投影长度为 `6 × 64 = 384` 步；投影试探步不等于普通梯度更新步。
+五准则、自适应 α、周期内冻结和最终历史重融合使用此前已适配的 CRIC。joint 有 64 个可剪枝参数组，投影长度 384 步；三种独立模式各有 32 个可剪枝参数组，投影长度 192 步。投影试探步不等于普通梯度更新步。
+
+## 独立剪枝模式
+
+| pruning_mode | 候选结构 | 不做结构剪枝的部分 | Phi-2 逻辑候选总数 |
+| --- | --- | --- | --- |
+| joint（兼容原默认） | FFN 神经元 + 注意力整头 | head_dim | 328704 |
+| ffn | FFN 神经元 | 整头、head_dim | 327680 |
+| num_head | 注意力整头 | FFN、head_dim | 1024 |
+| head_dim | 每头双维组，共 40 组/层 | FFN、整头 | 1280 |
+
+非候选参数保留训练资格，候选范围决定 CRIC 的选组预算，不手工指定最终删除索引。目标稀疏率针对各自逻辑候选，不代表三种模式有相同参数压缩率。原有 joint 调用保持可用，旧版结构包继续支持加载。
+
+head_dim 需要 qk_layernorm=False；当前原始 Phi-2 满足该条件。旋转区原本为每头 32 维，按 (i,i+16) 配对。压缩后局部注意力模块从原生 RoPE 常数中选择保留坐标，保留原来的 1/sqrt(80) 缩放。正常推理与生成使用原生计算流程，仅增加坐标选择；不修改安装包。
 
 ## 独立预处理
 
@@ -90,6 +105,16 @@ $P prune_phi2_hesso_cric.py --data-dir "$DATA" \
   --config phi2_smoke_config.json --output runs/my_phi2_run
 $P verify_phi2_pruning.py --run-dir runs/my_phi2_run
 ```
+
+分别验收三种模式时，使用对应配置和不同输出目录：
+
+```bash
+$P prune_phi2_hesso_cric.py --data-dir "$DATA" --config phi2_ffn_smoke_config.json --output runs/my_ffn_run
+$P prune_phi2_hesso_cric.py --data-dir "$DATA" --config phi2_num_head_smoke_config.json --output runs/my_num_head_run
+$P prune_phi2_hesso_cric.py --data-dir "$DATA" --config phi2_head_dim_smoke_config.json --output runs/my_head_dim_run
+```
+
+每个目录完成后再执行 verify_phi2_pruning.py。验收会核对逐层 Q/K/V、dense、FFN 的实际尺寸及 KV cache 的实际头数和 head_dim，并检查缓存续写、生成和反向传播。
 
 训练结束后先保存稀疏检查点。若导出诊断失败且尚未产生 compressed_model，可独立重试：
 

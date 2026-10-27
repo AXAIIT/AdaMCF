@@ -1,0 +1,21 @@
+{
+  "pruning_mode": "ffn",
+  "seed": 42,
+  "batch_size": 1,
+  "learning_rate": 0.0001,
+  "optimizer_variant": "sgd",
+  "first_momentum": 0.0,
+  "weight_decay": 0.0,
+  "target_group_sparsity": 0.1,
+  "warmup_steps": 2,
+  "sampling_steps": 2,
+  "max_cycle_period": 2,
+  "hybrid_training_steps": 8,
+  "post_pruning_steps": 4,
+  "adaptive_alpha": true,
+  "alpha_eval_batches": 1,
+  "grad_clip_norm": 1.0,
+  "log_every": 10,
+  "equivalence_atol": 0.0002,
+  "equivalence_rtol": 0.0002
+}

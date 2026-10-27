@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from safetensors.torch import load_file, save_file
 from transformers import PhiConfig, PhiForCausalLM
+from phi2_attention import adapt_head_dimensions, dimension_units
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
@@ -36,13 +37,17 @@ def validate_native_phi(model):
             raise ValueError('注意力头宽度或 FFN 连动关系错误。')
 
 
-def build_param_groups(model):
+def build_param_groups(model, pruning_mode='joint'):
     """由实际模块自动构造依赖组，全部可训练参数恰好归属一次。"""
     validate_native_phi(model)
+    if pruning_mode not in ('joint', 'ffn', 'num_head', 'head_dim'):
+        raise ValueError('pruning_mode 必须为 joint/ffn/num_head/head_dim。')
+    if pruning_mode == 'head_dim' and model.config.qk_layernorm:
+        raise ValueError('head_dim 模式不支持 qk_layernorm=True。')
     names = {id(p): name for name, p in model.named_parameters()}
     groups, owned = [], set()
 
-    def add(layer_index, kind, params, transforms, count):
+    def add(layer_index, kind, params, transforms, count, prunable=True):
         for p in params:
             if id(p) in owned:
                 raise ValueError('参数被多个剪枝组重复拥有。')
@@ -51,16 +56,21 @@ def build_param_groups(model):
             'id': f'layer_{layer_index:02d}_{kind}', 'layer_index': layer_index,
             'phi_kind': kind, 'params': params, 'p_names': [names[id(p)] for p in params],
             'p_transform': transforms, 'num_groups': count,
-            'is_prunable': True, 'is_auxiliary': False, 'auxiliary_ngs': [],
+            'is_prunable': prunable, 'is_auxiliary': False, 'auxiliary_ngs': [],
         })
 
     for index, layer in enumerate(model.model.layers):
         mlp, attn = layer.mlp, layer.self_attn
         add(index, 'ffn', [mlp.fc1.weight, mlp.fc1.bias, mlp.fc2.weight],
             [TensorTransform.BASIC, TensorTransform.BASIC, TensorTransform.TRANSPOSE],
-            mlp.fc1.out_features)
+            mlp.fc1.out_features, prunable=pruning_mode in ('joint', 'ffn'))
         heads = attn.q_proj.out_features // attn.head_dim
-        blocks = [list(range(h * attn.head_dim, (h + 1) * attn.head_dim)) for h in range(heads)]
+        if pruning_mode == 'head_dim':
+            units = dimension_units(attn.head_dim, attn.rotary_ndims)
+            blocks = [[head * attn.head_dim + dim for head in range(heads) for dim in unit]
+                      for unit in units]
+        else:
+            blocks = [list(range(h * attn.head_dim, (h + 1) * attn.head_dim)) for h in range(heads)]
         row_transform = make_index_groups_transform(blocks, axis=0)
         col_transform = make_index_groups_transform(blocks, axis=1)
         params, transforms = [], []
@@ -69,7 +79,12 @@ def build_param_groups(model):
             transforms.extend([row_transform, row_transform])
         params.append(attn.dense.weight)
         transforms.append(col_transform)
-        add(index, 'attention', params, transforms, heads)
+        if pruning_mode == 'head_dim':
+            add(index, 'head_dim', params, transforms, len(units))
+            groups[-1]['phi_dimension_units'] = units
+        else:
+            add(index, 'attention', params, transforms, heads,
+                prunable=pruning_mode in ('joint', 'num_head'))
 
     # 输出 bias、embedding、LayerNorm 等保持可训练，但不改变其结构维度。
     rest = [p for p in model.parameters() if id(p) not in owned]
@@ -85,7 +100,8 @@ def build_param_groups(model):
 
 
 def group_summary(groups):
-    return [{key: group[key] for key in ('id', 'num_groups', 'p_names', 'is_prunable')}
+    return [{**{key: group[key] for key in ('id', 'num_groups', 'p_names', 'is_prunable')},
+             'kind': group.get('phi_kind', 'unprunable')}
             for group in groups]
 
 
@@ -94,8 +110,21 @@ def collect_pruning_plan(model, optimizer):
     """只允许导出已经精确置零的最终组，防止把未结束的稀疏化当作压缩。"""
     if not optimizer.is_cric_terminated:
         raise RuntimeError('CRIC 尚未结束，不能物理导出。')
-    plan = {'format_version': 1, 'layers': []}
+    plan = {'format_version': 2, 'pruning_mode': getattr(optimizer, 'phi_pruning_mode', 'joint'), 'layers': []}
     by_layer = {}
+    # 未参与当前模式的结构使用恒等合同，继续训练但不会被误导出为删除。
+    for index, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        heads = attn.q_proj.out_features // attn.head_dim
+        ffn = layer.mlp.fc1.out_features
+        by_layer[index] = {
+            'layer_index': index,
+            'ffn': {'original': ffn, 'keep': list(range(ffn)), 'pruned': []},
+            'attention': {'original': heads, 'keep': list(range(heads)), 'pruned': []},
+            'head_dim': attn.head_dim, 'head_dim_keep': list(range(attn.head_dim)),
+            'head_dim_pruned': [], 'head_dim_pruned_units': [],
+            'rotary_ndims': attn.rotary_ndims, 'attention_scaling': attn.scaling,
+        }
     for group in optimizer.param_groups:
         if not group['is_prunable']:
             continue
@@ -108,19 +137,20 @@ def collect_pruning_plan(model, optimizer):
         for p, axis, physical in optimizer._pruning_slices(group, pruned):
             if torch.count_nonzero(p.index_select(axis, physical)).item():
                 raise RuntimeError(f'{group["id"]} 的被剪参数没有精确归零。')
-        entry = by_layer.setdefault(group['layer_index'], {'layer_index': group['layer_index']})
-        entry[group['phi_kind']] = {'original': group['num_groups'], 'keep': keep, 'pruned': pruned}
-    for index, layer in enumerate(model.model.layers):
-        entry = by_layer[index]
-        entry['head_dim'] = layer.self_attn.head_dim
-        if set(entry) != {'layer_index', 'ffn', 'attention', 'head_dim'}:
-            raise ValueError('每层必须同时有 FFN 和 attention 合同。')
-        plan['layers'].append(entry)
+        entry = by_layer[group['layer_index']]
+        if group['phi_kind'] == 'head_dim':
+            removed = sorted(dim for unit in pruned for dim in group['phi_dimension_units'][unit])
+            entry['head_dim_pruned'] = removed
+            entry['head_dim_keep'] = [i for i in range(entry['head_dim']) if i not in set(removed)]
+            entry['head_dim_pruned_units'] = pruned
+        else:
+            entry[group['phi_kind']] = {'original': group['num_groups'], 'keep': keep, 'pruned': pruned}
+    plan['layers'] = [by_layer[index] for index in range(len(model.model.layers))]
     return plan
 
 
 def validate_plan(model, plan):
-    if plan.get('format_version') != 1 or len(plan['layers']) != len(model.model.layers):
+    if plan.get('format_version') not in (1, 2) or len(plan['layers']) != len(model.model.layers):
         raise ValueError('结构清单版本或层数不一致。')
     for index, (layer, entry) in enumerate(zip(model.model.layers, plan['layers'])):
         expected = {'ffn': layer.mlp.fc1.out_features,
@@ -134,6 +164,23 @@ def validate_plan(model, plan):
                     or pruned != sorted(set(pruned)) or set(keep).intersection(pruned)
                     or sorted(keep + pruned) != list(range(count))):
                 raise ValueError(f'第 {index} 层 {kind} 的结构索引非法。')
+        kept = entry.get('head_dim_keep', list(range(entry['head_dim'])))
+        removed = entry.get('head_dim_pruned', [])
+        if (not kept or kept != sorted(set(kept)) or removed != sorted(set(removed))
+                or set(kept).intersection(removed)
+                or sorted(kept + removed) != list(range(entry['head_dim']))):
+            raise ValueError(f'第 {index} 层 head_dim 的索引非法。')
+        if removed:
+            if layer.self_attn.qk_layernorm:
+                raise ValueError('head_dim 剪枝不能改变 QK LayerNorm 的归一化统计。')
+            rotary = entry.get('rotary_ndims', layer.self_attn.rotary_ndims)
+            if rotary != layer.self_attn.rotary_ndims:
+                raise ValueError('原始旋转维度与模型不一致。')
+            for unit in dimension_units(entry['head_dim'], rotary):
+                if any(i in removed for i in unit) != all(i in removed for i in unit):
+                    raise ValueError('head_dim 删除必须保持双维组和 RoPE 配对完整。')
+        if abs(entry.get('attention_scaling', layer.self_attn.scaling) - layer.self_attn.scaling) > 1e-14:
+            raise ValueError('结构清单不得改变原 attention scaling。')
 
 
 @torch.no_grad()
@@ -166,17 +213,23 @@ def apply_structure(model, plan):
             keep = entry['ffn']['keep']
             mlp.fc1 = subset_linear(mlp.fc1, rows=keep)
             mlp.fc2 = subset_linear(mlp.fc2, columns=keep)
-        if entry['attention']['pruned']:
+        kept_dimensions = entry.get('head_dim_keep', list(range(entry['head_dim'])))
+        if entry['attention']['pruned'] or entry.get('head_dim_pruned'):
             physical = [head * entry['head_dim'] + offset
-                        for head in entry['attention']['keep'] for offset in range(entry['head_dim'])]
+                        for head in entry['attention']['keep'] for offset in kept_dimensions]
             for name in ('q_proj', 'k_proj', 'v_proj'):
                 setattr(attn, name, subset_linear(getattr(attn, name), rows=physical))
             attn.dense = subset_linear(attn.dense, columns=physical)
+        if entry.get('head_dim_pruned'):
+            layer.self_attn = adapt_head_dimensions(
+                attn, kept_dimensions, entry['rotary_ndims'], entry['attention_scaling'])
+            attn = layer.self_attn
         # 当前原生 Phi 根据投影实际宽度推导头数；RoPE 的 head_dim 保持不变。
         attn.num_key_value_groups = 1
     model.config.adamcf_layer_shapes = [
         {'intermediate_size': len(e['ffn']['keep']),
-         'num_attention_heads': len(e['attention']['keep']), 'head_dim': e['head_dim']}
+         'num_attention_heads': len(e['attention']['keep']),
+         'head_dim': len(e.get('head_dim_keep', list(range(e['head_dim']))))}
         for e in plan['layers']]
     model.config.adamcf_requires_structure_loader = True
     return model

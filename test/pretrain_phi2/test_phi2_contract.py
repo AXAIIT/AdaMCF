@@ -46,6 +46,116 @@ def zeroed_model_and_plan():
 
 
 class PhiStructureTests(unittest.TestCase):
+    def test_modes_have_exclusive_candidates_with_complete_parameter_ownership(self):
+        for mode, expected in [('ffn', 'ffn'), ('num_head', 'attention'), ('head_dim', 'head_dim')]:
+            with self.subTest(mode=mode):
+                model = tiny_model()
+                groups = build_param_groups(model, mode)
+                candidates = [g for g in groups if g['is_prunable']]
+                self.assertEqual({g['phi_kind'] for g in candidates}, {expected})
+                self.assertEqual(len(candidates), 2)
+                ids = [id(p) for g in groups for p in g['params']]
+                self.assertEqual(len(ids), len(set(ids)))
+                self.assertEqual(set(ids), {id(p) for p in model.parameters()})
+
+    def test_real_cric_selects_each_mode_and_exports_correct_structure(self):
+        from phi2_precision import audit_structure_precision
+        for mode in ['ffn', 'num_head', 'head_dim']:
+            with self.subTest(mode=mode):
+                model = tiny_model()
+                groups = build_param_groups(model, mode)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    optimizer = HESSOCRIC(groups, lr=.001, first_momentum=0., target_group_sparsity=.25,
+                                         start_cric_step=1, sampling_steps=2, hybrid_training_steps=3,
+                                         max_cycle_period=2, alpha_scheduler_cfg={'warmup_updates':0, 'min_gap_std':1e9})
+                    optimizer.phi_pruning_mode = mode
+                    tokens = torch.arange(8).reshape(1, -1)
+                    for _ in range(32):
+                        optimizer.zero_grad()
+                        loss = model(tokens, labels=tokens, use_cache=False).loss
+                        loss.backward()
+                        if optimizer.will_update_alpha_on_next_step():
+                            optimizer.alpha_scheduler.update(model, None, [({'input_ids':tokens,'labels':tokens},None)])
+                        optimizer.step(loss.detach())
+                plan = collect_pruning_plan(model, optimizer)
+                self.assertGreater(optimizer.alpha_scheduler.update_count, 0)
+                if mode == 'ffn':
+                    self.assertGreater(sum(len(e['ffn']['pruned']) for e in plan['layers']), 0)
+                    self.assertEqual(sum(len(e['attention']['pruned']) for e in plan['layers']), 0)
+                elif mode == 'num_head':
+                    self.assertGreater(sum(len(e['attention']['pruned']) for e in plan['layers']), 0)
+                    self.assertEqual(sum(len(e['ffn']['pruned']) for e in plan['layers']), 0)
+                else:
+                    self.assertGreater(sum(len(e['head_dim_pruned_units']) for e in plan['layers']), 0)
+                    self.assertEqual(sum(len(e['ffn']['pruned']) for e in plan['layers']), 0)
+                    self.assertEqual(sum(len(e['attention']['pruned']) for e in plan['layers']), 0)
+                compact = copy.deepcopy(model)
+                apply_structure(compact, plan)
+                audit, _ = audit_structure_precision(model, compact, {'input_ids': tokens})
+                self.assertTrue(audit['structure_fp64']['passed'])
+                self.assertLess(parameter_count(compact), parameter_count(model))
+                with tempfile.TemporaryDirectory() as tmp:
+                    folder = Path(tmp) / 'package'
+                    save_pruned_package(compact, SimpleNamespace(save_pretrained=lambda _:None), plan, folder)
+                    other = load_pruned_package(folder).eval()
+                with torch.no_grad():
+                    torch.testing.assert_close(other(tokens, use_cache=False).logits,
+                                               compact(tokens, use_cache=False).logits)
+                    cached = other(tokens, use_cache=True)
+                    for i, entry in enumerate(plan['layers']):
+                        key, value = cached.past_key_values[i]
+                        self.assertEqual(key.shape[1], len(entry['attention']['keep']))
+                        self.assertEqual(key.shape[-1], len(entry['head_dim_keep']))
+                    next_token = cached.logits[:, -1:].argmax(-1)
+                    continuation = other(next_token, past_key_values=cached.past_key_values, use_cache=True).logits
+                    full = other(torch.cat([tokens, next_token], dim=1), use_cache=False).logits[:, -1:]
+                    torch.testing.assert_close(continuation, full, atol=1e-6, rtol=1e-5)
+                other.train()
+                other(tokens, labels=tokens, use_cache=False).loss.backward()
+                self.assertTrue(torch.isfinite(torch.nn.utils.clip_grad_norm_(other.parameters(),1.,error_if_nonfinite=True)))
+
+    def test_head_dim_rejects_broken_rope_pair(self):
+        model, plan = zeroed_model_and_plan()
+        entry = plan['layers'][0]
+        entry['head_dim_pruned'] = [0]
+        entry['head_dim_keep'] = list(range(1, 8))
+        with self.assertRaisesRegex(ValueError, '配对'):
+            apply_structure(model, plan)
+
+    def test_head_dim_can_remove_entire_rotary_region_without_rebasing(self):
+        from phi2_precision import audit_structure_precision
+        model = tiny_model()
+        groups = build_param_groups(model, 'head_dim')
+        with contextlib.redirect_stdout(io.StringIO()):
+            optimizer = HESSOCRIC(groups, lr=.01, sampling_steps=2, hybrid_training_steps=3)
+        optimizer.phi_pruning_mode = 'head_dim'
+        for group in optimizer.param_groups:
+            if group['is_prunable']:
+                group['pruned_idxes'] = [0,1]
+                optimizer._scale_group(group, [0,1], 0.)
+        optimizer.is_cric_terminated = True
+        plan = collect_pruning_plan(model, optimizer)
+        compact = copy.deepcopy(model)
+        apply_structure(compact, plan)
+        self.assertTrue(all(layer.self_attn.rotary_ndims == 0 for layer in compact.model.layers))
+        audit, _ = audit_structure_precision(model, compact, {'input_ids':torch.arange(8).reshape(1,-1)})
+        self.assertTrue(audit['structure_fp64']['passed'])
+
+    def test_previous_version1_structure_package_remains_loadable(self):
+        model, plan = zeroed_model_and_plan()
+        old = {'format_version':1, 'layers':[
+            {key: entry[key] for key in ('layer_index','ffn','attention','head_dim')}
+            for entry in plan['layers']]}
+        apply_structure(model, old)
+        tokens = torch.arange(8).reshape(1,-1)
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / 'old_package'
+            save_pruned_package(model, SimpleNamespace(save_pretrained=lambda _:None), old, package)
+            restored = load_pruned_package(package).eval()
+        with torch.no_grad():
+            torch.testing.assert_close(restored(tokens, use_cache=False).logits,
+                                       model(tokens, use_cache=False).logits)
+
     def test_all_parameters_owned_once_and_output_bias_protected(self):
         model = tiny_model()
         groups = build_param_groups(model)
