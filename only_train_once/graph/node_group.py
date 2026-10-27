@@ -547,6 +547,8 @@ class NodeGroupComposedOp(BasicNodeGroup):
             self.op.prune_out_dim(pruned_idxes=self.pruning_redundant_idxes, skip_output_node=True)  # 调用剪枝方法
             # 遍历节点组中的每个节点
             for node in self:  
+                if getattr(self.op, 'handles_internal_input_pruning', False):
+                    node.pruned_status['in_dim'] = True
                 # 如果节点是输出节点
                 if node.id in self.output_nodes:  
                     continue

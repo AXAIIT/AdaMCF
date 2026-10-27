@@ -4,21 +4,22 @@ import numpy as np
 import inspect
 from packaging.version import Version
 from collections import defaultdict
+from only_train_once.torch_compat import TORCH_VERSION, set_onnx_opset_version
 from only_train_once.operation import COMPOSED_MODULES, BASIC_MODULES, Operator, ParamOTO
 from only_train_once.assets import THEMES
 from .node import Node
 from .node_group import NodeGroupComposedOp, NodeGroup, BasicNodeGroup
 from only_train_once.transform.graph_transform import FRAMEWORK_TRANSFORMS
-from only_train_once.transform import TensorTransform, tensor_transformation, index_transformation
+from only_train_once.transform import (
+    TensorTransform,
+    tensor_transformation,
+    index_transformation,
+    index_transformation_param_group,
+    pruning_axis,
+)
 import warnings
 import pprint
 
-
-# 检查torch版本，设置ONNX导出opset版本，保证兼容性
-if Version(torch.__version__) >= Version('1.13.0'):
-    from torch.onnx._globals import GLOBALS
-    # 1.13默认opset 14不支持gridsample，这里强制设置为16
-    GLOBALS.export_onnx_opset_version = 16 
 
 from .utils import (
     _get_str_inside_parenthesis, 
@@ -29,7 +30,8 @@ from .utils import (
 
 class Graph:
     """跟踪有向图的节点和边，并支持基本操作。"""
-    def __init__(self, model=None, dummy_input=None, trace_onnx=True, skip_patterns=None, strict_out_nodes=False):
+    def __init__(self, model=None, dummy_input=None, trace_onnx=True, skip_patterns=None, strict_out_nodes=False,
+                 onnx_opset_version=None):
         """
         初始化 Graph 对象，构建神经网络的 有向计算图结构 。
         参数说明：
@@ -38,6 +40,7 @@ class Graph:
         - trace_onnx: 是否使用 ONNX 优化跟踪
         - skip_patterns: 跳过的模式（字符串或字符串列表），用于移除特定结构
         - strict_out_nodes: 是否严格只将无出边节点作为输出节点
+        - onnx_opset_version: OTO 图追踪使用的 ONNX opset；None 时保持当前 PyTorch 默认值
         初始化内容：
         - 初始化节点、边、节点组、输入输出节点等数据结构
         - 处理参数分组（可训练/不可训练）
@@ -52,11 +55,18 @@ class Graph:
         self.node_groups = dict()       # 节点组
         self.output_nodes = dict()      # 输出节点
         self.input_nodes = dict()       # 输入节点
+        # 由 ``register_segmented_concat_consumer_contracts`` 显式登记的通用
+        # Concat 输入段合同。默认空列表，不参与任何既有模型的构图或物理裁剪。
+        self.segmented_concat_consumer_contracts = list()
+        self.segmented_concat_contract_registration = dict()
         self.dummy_input = dummy_input  # 追踪图用的输入
         self.params_grad = dict()       # 可训练参数
         self.params_no_grad = dict()    # 不可训练参数
         self.param_names = list()       # 参数名列表
         self.trace_onnx = trace_onnx    # 是否用 ONNX trace
+        self.onnx_opset_version = None  # None 表示不覆盖当前 PyTorch 的默认 opset
+        if onnx_opset_version is not None:
+            self.onnx_opset_version = set_onnx_opset_version(onnx_opset_version)
         self.root_module = None         # 根模块
         self.theme = THEMES["basic"]    # 可视化主题
         self.skip_patterns = []         # 跳过的模式，跳过哪些节点和边
@@ -976,13 +986,10 @@ class Graph:
         else:
             # 根据PyTorch版本选择不同的ONNX优化方式
             # 截至2025.05.09，pytorch版本已经更新到2.6
-            if Version(torch.__version__) >= Version('1.9.0') and Version(torch.__version__) <= Version('1.11.10'):
+            if Version('1.9.0') <= TORCH_VERSION <= Version('1.11.10'):
                 print(f"Info: Used torch.onnx.utils._optimize_graph for PyTorch {torch.__version__}.")
                 trace_graph = torch.onnx._optimize_trace(trace_graph, torch.onnx.OperatorExportTypes.ONNX)
-            elif Version(torch.__version__) >= Version('1.13.0') and Version(torch.__version__) < Version('1.7.0'):
-                print(f"Info: Used torch.onnx.utils._optimize_graph for PyTorch {torch.__version__}.")
-                trace_graph = torch.onnx._optimize_graph(trace_graph, torch.onnx.OperatorExportTypes.ONNX)
-            elif Version(torch.__version__) >= Version('1.7.0'): # 例如 PyTorch 2.7.0 及更新版本
+            elif TORCH_VERSION >= Version('1.7.0'): # 例如 PyTorch 2.7.0 及更新版本
                 from torch.onnx import utils as onnx_utils
                 print(f"Info: Used torch.onnx.utils._optimize_graph for PyTorch {torch.__version__}.")
                 trace_graph = onnx_utils._optimize_graph(trace_graph, torch.onnx.OperatorExportTypes.ONNX)
@@ -1542,7 +1549,16 @@ class Graph:
                     continue
 
                 # 根据不同的张量变换方式对参数进行置零操作
-                if p_transform == TensorTransform.TRANSPOSE and len(param.data.shape) > 1:
+                if isinstance(p_transform, dict):
+                    # 显式索引组由算子声明物理轴和通道映射，Graph 无需了解模型布局。
+                    refined_zero_idxes = index_transformation_param_group(
+                        zero_group_idxes, p_transform, param_group
+                    )
+                    if pruning_axis(p_transform) == 1 and len(param.data.shape) > 1:
+                        param.data[:, refined_zero_idxes, ...] = 0.0
+                    else:
+                        param.data[refined_zero_idxes] = 0.0
+                elif p_transform == TensorTransform.TRANSPOSE and len(param.data.shape) > 1:
                     # 对转置张量：按列（第1维）置零
                     param.data[:, zero_group_idxes, ...] = 0.0
                 elif p_transform == TensorTransform.MULTIHEAD_HEADDIM:
@@ -1758,7 +1774,19 @@ class Graph:
         # 移除标记为完全不可训练的参数组
         for remove_id in untrainable_param_group_ids:
             del param_groups[remove_id]
-        param_groups = dict(sorted(param_groups.items(), key=lambda kv:(kv[0], kv[1]))) # 按节点组ID对参数组进行排序，保证每次获取的顺序一致
+        # 参数可能同时出现在“结构剪枝所有者”和“外部形状依赖组”中。过去仅按
+        # trace 生成的 node id 排序后先到先得，node 编号轻微漂移就可能让普通
+        # 依赖组抢走复合算子的内部参数。允许算子声明显式所有权优先级；未声明
+        # 的所有既有模型仍保持 priority=0，并继续按节点组 ID 稳定排序。
+        param_groups = dict(
+            sorted(
+                param_groups.items(),
+                key=lambda item: (
+                    -int(item[1].get('parameter_ownership_priority', 0)),
+                    str(item[0]),
+                ),
+            )
+        )
         
         seen_param_ids = set()
         for group_id, group in list(param_groups.items()):
@@ -1794,8 +1822,727 @@ class Graph:
                     continue
                 if isinstance(value, list) and len(value) == len(params):
                     filtered_group[key] = [value[idx] for idx in keep_indices]
+
+            # NO_PRUNE 表示参数应正常参与优化，但绝不能参与结构评分、置零或
+            # 物理裁剪。若去重后一个参数组只剩 NO_PRUNE 参数，则无论原始
+            # NodeGroup 标志如何，都应在交给 HESSO 前降级为不可剪组。这样可
+            # 安全覆盖 ONNX trace 折叠 BN 后形成的“仅参数所有权”组，也保持
+            # 既有优化器更新语义不变。
+            transforms = filtered_group.get('p_transform', [])
+            if transforms and all(
+                transform == TensorTransform.NO_PRUNE for transform in transforms
+            ):
+                filtered_group['is_prunable'] = False
+                filtered_group['structural_pruning_disabled_reason'] = (
+                    'all_parameter_transforms_no_prune'
+                )
             param_groups[group_id] = filtered_group
         return param_groups.values()    # 返回排序后的参数组信息列表
+
+    def output_consumer_closure_records(self, producer_parameter_names=()):
+        """返回生产者输出轴及其消费者输入轴所在的实际 OTO 参数组。
+
+        这是一个只读的通用图查询：不改变节点组、参数优先级或剪枝行为，因此旧
+        模型不会受到影响。调用方只需提供任意生产者参数名（通常是 Conv weight），
+        即可基于 OTO 已经解析出的参数变换，识别该输出轴在同一依赖组中对应的
+        axis=1 消费者。模型 profile 可据此构建结构合同，而无需依赖层号或手工
+        保护下游模块。
+        """
+
+        producer_names = {str(name) for name in producer_parameter_names if name}
+        if not producer_names:
+            return []
+
+        def transform_axis(transform):
+            if transform == TensorTransform.TRANSPOSE:
+                return 1
+            if isinstance(transform, dict) and "axis" in transform:
+                return int(transform["axis"])
+            # BASIC / ACCESSORY 等既有 OTO 变换默认作用于参数 axis=0。
+            return 0
+
+        records = []
+        for group in self.get_param_groups():
+            parameter_names = list(group.get("p_names", []))
+            transforms = list(group.get("p_transform", []))
+            producer_indices = [
+                index
+                for index, name in enumerate(parameter_names)
+                if name in producer_names
+            ]
+            if not producer_indices:
+                continue
+            consumer_names = sorted(
+                name
+                for index, (name, transform) in enumerate(
+                    zip(parameter_names, transforms)
+                )
+                if index not in producer_indices and transform_axis(transform) == 1
+            )
+            records.append(
+                {
+                    "node_group_id": str(group.get("id")),
+                    "is_prunable": bool(group.get("is_prunable")),
+                    "is_auxiliary": bool(group.get("is_auxiliary")),
+                    "num_groups": int(group.get("num_groups", 0)),
+                    "producer_parameter_names": sorted(
+                        parameter_names[index] for index in producer_indices
+                    ),
+                    "consumer_input_parameter_names": consumer_names,
+                    "dependency_closure_parameter_names": sorted(parameter_names),
+                }
+            )
+        return sorted(records, key=lambda record: record["node_group_id"])
+
+    def discover_output_consumer_closures(self, producer_parameter_names=()):
+        """按实际计算图发现生产者输出轴的首个卷积消费者。
+
+        ``get_param_groups()`` 只表达同一逻辑剪枝组内的参数变换，不能覆盖所有
+        ``producer output -> consumer input`` 关系：普通 Conv 输入轴通常位于另一
+        个节点组，而深度卷积会以 axis=0 的耦合输出轴出现。因此本查询严格从图
+        拓扑出发，而不是把 ``TensorTransform.TRANSPOSE`` 当作消费者的唯一证据。
+
+        返回结果仅用于合同审计/登记，不会修改节点组、优化器参数组或任何已有
+        模型的剪枝行为。每条路径在遇到首个 Conv2d 时停止；遇到 channel concat、
+        residual add、slice/split 等需要坐标映射的边界时 fail-closed 并记录原因。
+        调用方必须为这类边界另行提供 segment-offset 或其他显式物理合同。
+        """
+
+        producer_names = {str(name) for name in producer_parameter_names if name}
+        if not producer_names:
+            return []
+
+        def _node_parameter_names(node):
+            return [str(name) for name in getattr(node, "param_names", [])]
+
+        def _node_label(node):
+            return str(getattr(node, "op_name", "") or "").lower()
+
+        def _is_contract_boundary(node):
+            label = _node_label(node)
+            if node.is_concat(axis=1):
+                return "channel_concat_requires_segment_offset_contract"
+            if label in {"add", "sum", "sub", "subtract"}:
+                return "residual_or_arithmetic_merge_requires_explicit_contract"
+            if label in {"split", "chunk", "slice", "gather", "getitem"}:
+                return "partition_or_indexing_requires_explicit_contract"
+            return None
+
+        def _consumer_kind(module):
+            if not isinstance(module, torch.nn.Conv2d):
+                return None
+            in_channels = int(module.in_channels)
+            out_channels = int(module.out_channels)
+            groups = int(module.groups)
+            if groups == 1:
+                return "standard_conv_input_axis1"
+            if groups == in_channels == out_channels:
+                return "depthwise_coupled_axis0"
+            return "unsupported_grouped_conv"
+
+        source_nodes_by_name = defaultdict(list)
+        for node in self.nodes.values():
+            for parameter_name in _node_parameter_names(node):
+                if parameter_name in producer_names:
+                    source_nodes_by_name[parameter_name].append(node)
+
+        records = []
+        for producer_name in sorted(producer_names):
+            source_nodes = sorted(
+                source_nodes_by_name.get(producer_name, []),
+                key=lambda node: str(node.id),
+            )
+            if len(source_nodes) != 1:
+                records.append(
+                    {
+                        "producer_parameter_name": producer_name,
+                        "producer_node_ids": [str(node.id) for node in source_nodes],
+                        "consumer_records": [],
+                        "unresolved_paths": [
+                            {
+                                "reason": "expected_exactly_one_producer_graph_node",
+                                "path_node_ids": [str(node.id) for node in source_nodes],
+                            }
+                        ],
+                        "status": "unresolved",
+                    }
+                )
+                continue
+
+            source_node = source_nodes[0]
+            queue = [(source_node, [source_node])]
+            # 以 ``(node id, path)`` 去重会保留不同分支，避免一个已访问中间节点
+            # 错误吞掉从同一生产者出发的另一条消费者路径。
+            visited = set()
+            consumers = []
+            unresolved_paths = []
+            while queue:
+                node, path = queue.pop(0)
+                visit_key = (str(node.id), tuple(str(item.id) for item in path[:-1]))
+                if visit_key in visited:
+                    continue
+                visited.add(visit_key)
+
+                for next_node in self.outgoing(node):
+                    next_path = [*path, next_node]
+                    boundary_reason = _is_contract_boundary(next_node)
+                    if boundary_reason:
+                        unresolved_paths.append(
+                            {
+                                "reason": boundary_reason,
+                                "boundary_node_id": str(next_node.id),
+                                "boundary_op_name": str(next_node.op_name),
+                                "path_node_ids": [str(item.id) for item in next_path],
+                            }
+                        )
+                        continue
+
+                    module = getattr(getattr(next_node, "op", None), "module", None)
+                    if isinstance(module, torch.nn.Conv2d):
+                        kind = _consumer_kind(module)
+                        weight_names = [
+                            name
+                            for name in _node_parameter_names(next_node)
+                            if name.endswith(".weight")
+                        ]
+                        if len(weight_names) != 1:
+                            unresolved_paths.append(
+                                {
+                                    "reason": "consumer_conv_requires_exactly_one_weight_parameter",
+                                    "consumer_node_id": str(next_node.id),
+                                    "path_node_ids": [str(item.id) for item in next_path],
+                                }
+                            )
+                        elif kind == "unsupported_grouped_conv":
+                            unresolved_paths.append(
+                                {
+                                    "reason": "unsupported_grouped_conv_consumer",
+                                    "consumer_node_id": str(next_node.id),
+                                    "consumer_parameter_name": weight_names[0],
+                                    "consumer_in_channels": int(module.in_channels),
+                                    "consumer_out_channels": int(module.out_channels),
+                                    "consumer_groups": int(module.groups),
+                                    "path_node_ids": [str(item.id) for item in next_path],
+                                }
+                            )
+                        else:
+                            consumers.append(
+                                {
+                                    "consumer_node_id": str(next_node.id),
+                                    "consumer_parameter_name": weight_names[0],
+                                    "consumer_kind": kind,
+                                    "consumer_in_channels": int(module.in_channels),
+                                    "consumer_out_channels": int(module.out_channels),
+                                    "consumer_groups": int(module.groups),
+                                    "path_node_ids": [str(item.id) for item in next_path],
+                                    "path_op_names": [str(item.op_name) for item in next_path],
+                                }
+                            )
+                        continue
+
+                    # 非卷积节点只作为逐通道透明路径继续传播。若抵达图输出，
+                    # 生产者本身就是语义输出，当前通用合同不能改变其通道宽度。
+                    if next_node.is_dummy():
+                        unresolved_paths.append(
+                            {
+                                "reason": "producer_reaches_graph_output_without_conv_consumer",
+                                "path_node_ids": [str(item.id) for item in next_path],
+                            }
+                        )
+                        continue
+                    queue.append((next_node, next_path))
+
+            consumers_by_key = {
+                (item["consumer_node_id"], item["consumer_parameter_name"]): item
+                for item in consumers
+            }
+            ordered_consumers = [
+                consumers_by_key[key]
+                for key in sorted(consumers_by_key)
+            ]
+            ordered_unresolved = sorted(
+                unresolved_paths,
+                key=lambda item: (
+                    str(item.get("reason", "")),
+                    tuple(item.get("path_node_ids", [])),
+                ),
+            )
+            records.append(
+                {
+                    "producer_parameter_name": producer_name,
+                    "producer_node_ids": [str(source_node.id)],
+                    "consumer_records": ordered_consumers,
+                    "unresolved_paths": ordered_unresolved,
+                    "status": (
+                        "resolved_direct_closure"
+                        if ordered_consumers and not ordered_unresolved
+                        else "unresolved"
+                    ),
+                }
+            )
+        return records
+
+    def register_segmented_concat_consumer_contracts(
+        self,
+        producer_parameter_names=(),
+    ):
+        """登记通用 channel-Concat ``segment -> Conv.in`` 物理合同。
+
+        该 API 没有任何模型名称、层号或 YOLO 假设。调用方显式给出希望开放的
+        生产者 Conv 权重名；Graph 从真实拓扑中识别其进入 channel concat 的输入段，
+        以 ``Node.inputs`` 的原始输入顺序冻结每段的原始 offset/width，再登记到
+        下游普通 Conv 的 input-axis 合同中。
+
+        HESSO 的逻辑组所有权始终保留在生产者节点组。合同只在物理构网阶段把
+        已确定的生产者冗余索引转换为消费者 input-axis 的原始坐标，多个输入段对
+        同一消费者合并后只裁一次。任何无法保留输入顺序、无法识别唯一生产者、
+        非通道 Concat、残差/切片边界或 grouped Conv 消费者都会返回未配置记录，
+        调用方必须 fail-closed，不能猜测 offset。
+        """
+
+        producer_names = {str(name) for name in producer_parameter_names if name}
+        if not producer_names:
+            self.segmented_concat_consumer_contracts = []
+            self.segmented_concat_contract_registration = {
+                "status": "not_applicable",
+                "contracts": [],
+                "source_coverage": {},
+            }
+            return self.segmented_concat_contract_registration
+
+        transparent_ops = {
+            "batchnorm",
+            "batchnormalization",
+            "relu",
+            "leakyrelu",
+            "sigmoid",
+            "silu",
+            "hardswish",
+            "gelu",
+            "mul",
+            "resize",
+            "upsample",
+            "maxpool",
+            "averagepool",
+            "adaptiveavgpool",
+            "dropout",
+            "identity",
+        }
+        merge_or_partition_ops = {
+            "add": "residual_or_arithmetic_merge_requires_explicit_contract",
+            "sum": "residual_or_arithmetic_merge_requires_explicit_contract",
+            "sub": "residual_or_arithmetic_merge_requires_explicit_contract",
+            "subtract": "residual_or_arithmetic_merge_requires_explicit_contract",
+            "split": "partition_or_indexing_requires_explicit_contract",
+            "chunk": "partition_or_indexing_requires_explicit_contract",
+            "slice": "partition_or_indexing_requires_explicit_contract",
+            "gather": "partition_or_indexing_requires_explicit_contract",
+            "getitem": "partition_or_indexing_requires_explicit_contract",
+        }
+
+        def node_label(node):
+            return str(getattr(node, "op_name", "") or "").lower()
+
+        def node_weight_names(node):
+            return sorted(
+                str(name)
+                for name in getattr(node, "param_names", [])
+                if str(name).endswith(".weight")
+            )
+
+        def node_module(node):
+            return getattr(getattr(node, "op", None), "module", None)
+
+        def is_conv2d(node):
+            return isinstance(node_module(node), torch.nn.Conv2d)
+
+        def is_channel_concat(node):
+            return bool(node.is_concat(axis=1))
+
+        def first_upstream_conv(start_node):
+            """沿透明上游节点回溯唯一 Conv2d；多源即拒绝。"""
+
+            stack = [start_node]
+            visited = set()
+            conv_nodes = {}
+            failures = []
+            while stack:
+                current = stack.pop()
+                if str(current.id) in visited:
+                    continue
+                visited.add(str(current.id))
+                if is_conv2d(current):
+                    conv_nodes[str(current.id)] = current
+                    continue
+                if is_channel_concat(current):
+                    failures.append("nested_channel_concat_requires_own_contract")
+                    continue
+                label = node_label(current)
+                if label in merge_or_partition_ops:
+                    failures.append(merge_or_partition_ops[label])
+                    continue
+                if label not in transparent_ops:
+                    failures.append(f"unsupported_transparent_op:{label or 'unknown'}")
+                    continue
+                incoming_nodes = [
+                    node for node in self.incoming(current) if not node.is_dummy()
+                ]
+                if not incoming_nodes:
+                    failures.append("segment_has_no_upstream_conv_producer")
+                    continue
+                stack.extend(incoming_nodes)
+            if failures:
+                return None, sorted(set(failures))
+            if len(conv_nodes) != 1:
+                return None, [
+                    "segment_requires_exactly_one_upstream_conv_producer:"
+                    f"found_{len(conv_nodes)}"
+                ]
+            return next(iter(conv_nodes.values())), []
+
+        def downstream_standard_convs(concat_node):
+            """从 Concat 输出沿透明节点查找首个普通 Conv2d 消费者。"""
+
+            queue = [(concat_node, [concat_node])]
+            visited = set()
+            consumers = {}
+            failures = []
+            while queue:
+                current, path = queue.pop(0)
+                visit_key = (str(current.id), tuple(str(node.id) for node in path[:-1]))
+                if visit_key in visited:
+                    continue
+                visited.add(visit_key)
+                for next_node in self.outgoing(current):
+                    next_path = [*path, next_node]
+                    if is_channel_concat(next_node):
+                        failures.append("nested_channel_concat_requires_own_contract")
+                        continue
+                    label = node_label(next_node)
+                    if label in merge_or_partition_ops:
+                        failures.append(merge_or_partition_ops[label])
+                        continue
+                    if is_conv2d(next_node):
+                        module = node_module(next_node)
+                        weights = node_weight_names(next_node)
+                        if len(weights) != 1:
+                            failures.append("consumer_conv_requires_exactly_one_weight_parameter")
+                        elif int(module.groups) != 1:
+                            failures.append("concat_consumer_requires_standard_conv_groups_1")
+                        else:
+                            consumers[str(next_node.id)] = {
+                                "consumer_node_id": str(next_node.id),
+                                "consumer_parameter_name": weights[0],
+                                "consumer_in_channels": int(module.in_channels),
+                                "consumer_out_channels": int(module.out_channels),
+                                "consumer_groups": int(module.groups),
+                                "path_node_ids": [str(node.id) for node in next_path],
+                            }
+                        continue
+                    if next_node.is_dummy():
+                        failures.append("concat_reaches_graph_output_without_conv_consumer")
+                        continue
+                    if label not in transparent_ops:
+                        failures.append(f"unsupported_transparent_op:{label or 'unknown'}")
+                        continue
+                    queue.append((next_node, next_path))
+            if not consumers:
+                failures.append("concat_has_no_standard_conv_consumer")
+            return [consumers[key] for key in sorted(consumers)], sorted(set(failures))
+
+        output_to_nodes = defaultdict(list)
+        for node in self.nodes.values():
+            for output_id in getattr(node, "outputs", []):
+                output_to_nodes[str(output_id)].append(node)
+
+        ownership_by_parameter = defaultdict(list)
+        for group in self.get_param_groups():
+            for parameter_name in group.get("p_names", []):
+                ownership_by_parameter[str(parameter_name)].append(
+                    {
+                        "node_group_id": str(group.get("id")),
+                        "logical_group_count": int(group.get("num_groups", 0) or 0),
+                    }
+                )
+
+        source_nodes_by_parameter = defaultdict(list)
+        for node in self.nodes.values():
+            for parameter_name in node_weight_names(node):
+                if parameter_name in producer_names:
+                    source_nodes_by_parameter[parameter_name].append(node)
+
+        source_infos = {}
+        source_coverage = {
+            producer_name: [] for producer_name in sorted(producer_names)
+        }
+        for producer_name in sorted(producer_names):
+            nodes = sorted(
+                source_nodes_by_parameter.get(producer_name, []),
+                key=lambda node: str(node.id),
+            )
+            owners = ownership_by_parameter.get(producer_name, [])
+            errors = []
+            if len(nodes) != 1:
+                errors.append(f"expected_exactly_one_producer_node:found_{len(nodes)}")
+            if len(owners) != 1:
+                errors.append(f"expected_exactly_one_producer_owner:found_{len(owners)}")
+            node = nodes[0] if len(nodes) == 1 else None
+            module = node_module(node) if node is not None else None
+            if not isinstance(module, torch.nn.Conv2d):
+                errors.append("producer_requires_Conv2d")
+            elif len(owners) == 1 and int(owners[0]["logical_group_count"]) != int(module.out_channels):
+                errors.append(
+                    "producer_logical_group_count_must_match_output_channels:"
+                    f"groups_{owners[0]['logical_group_count']}_out_{module.out_channels}"
+                )
+            if errors:
+                source_coverage[producer_name].append(
+                    {
+                        "status": "unresolved",
+                        "reason": ";".join(errors),
+                    }
+                )
+                continue
+            source_infos[producer_name] = {
+                "producer_parameter_name": producer_name,
+                "producer_node": node,
+                "producer_node_id": str(node.id),
+                "owner_node_group_id": owners[0]["node_group_id"],
+                "original_width": int(module.out_channels),
+            }
+
+        # ``concat_id -> input_index -> source parameter names``。输入段位置必须由
+        # Concat 的原始 ``Node.inputs`` 确定，不能使用图边插入顺序。
+        concat_hits = defaultdict(lambda: defaultdict(set))
+        for producer_name, source_info in source_infos.items():
+            queue = [(source_info["producer_node"], [source_info["producer_node"]])]
+            visited = set()
+            while queue:
+                current, path = queue.pop(0)
+                visit_key = (str(current.id), tuple(str(node.id) for node in path[:-1]))
+                if visit_key in visited:
+                    continue
+                visited.add(visit_key)
+                for next_node in self.outgoing(current):
+                    next_path = [*path, next_node]
+                    if is_channel_concat(next_node):
+                        slots = [
+                            index
+                            for index, input_id in enumerate(getattr(next_node, "inputs", []))
+                            if str(input_id) in {str(output_id) for output_id in getattr(current, "outputs", [])}
+                        ]
+                        if len(slots) != 1:
+                            source_coverage[producer_name].append(
+                                {
+                                    "status": "unresolved",
+                                    "reason": "concat_input_slot_not_uniquely_recoverable",
+                                    "concat_node_id": str(next_node.id),
+                                    "path_node_ids": [str(node.id) for node in next_path],
+                                }
+                            )
+                        else:
+                            concat_hits[str(next_node.id)][slots[0]].add(producer_name)
+                        continue
+                    if is_conv2d(next_node):
+                        # 直连消费者由 OTO 原有单源 input propagation 处理；本合同
+                        # 只负责 Concat 段的原始坐标映射。
+                        continue
+                    label = node_label(next_node)
+                    if label in merge_or_partition_ops:
+                        source_coverage[producer_name].append(
+                            {
+                                "status": "unresolved",
+                                "reason": merge_or_partition_ops[label],
+                                "path_node_ids": [str(node.id) for node in next_path],
+                            }
+                        )
+                        continue
+                    if next_node.is_dummy():
+                        source_coverage[producer_name].append(
+                            {
+                                "status": "unresolved",
+                                "reason": "producer_reaches_graph_output_without_conv_consumer",
+                                "path_node_ids": [str(node.id) for node in next_path],
+                            }
+                        )
+                        continue
+                    if label not in transparent_ops:
+                        source_coverage[producer_name].append(
+                            {
+                                "status": "unresolved",
+                                "reason": f"unsupported_transparent_op:{label or 'unknown'}",
+                                "path_node_ids": [str(node.id) for node in next_path],
+                            }
+                        )
+                        continue
+                    queue.append((next_node, next_path))
+
+        contracts = []
+        for concat_id, active_hits_by_slot in sorted(concat_hits.items()):
+            concat_node = self.nodes.get(concat_id)
+            if concat_node is None or not is_channel_concat(concat_node):
+                for producer_names_at_concat in active_hits_by_slot.values():
+                    for producer_name in producer_names_at_concat:
+                        source_coverage[producer_name].append(
+                            {
+                                "status": "unresolved",
+                                "reason": "concat_node_missing_or_not_channel_concat",
+                                "concat_node_id": concat_id,
+                            }
+                        )
+                continue
+
+            segments = []
+            segment_errors = []
+            offset = 0
+            for input_index, input_id in enumerate(getattr(concat_node, "inputs", [])):
+                upstream_nodes = output_to_nodes.get(str(input_id), [])
+                if len(upstream_nodes) != 1:
+                    segment_errors.append(
+                        f"concat_input_{input_index}_requires_exactly_one_graph_producer:found_{len(upstream_nodes)}"
+                    )
+                    continue
+                upstream_node = upstream_nodes[0]
+                upstream_conv, upstream_errors = first_upstream_conv(upstream_node)
+                if upstream_errors or upstream_conv is None:
+                    segment_errors.extend(
+                        f"concat_input_{input_index}:{error}" for error in upstream_errors
+                    )
+                    continue
+                weights = node_weight_names(upstream_conv)
+                module = node_module(upstream_conv)
+                if len(weights) != 1 or not isinstance(module, torch.nn.Conv2d):
+                    segment_errors.append(
+                        f"concat_input_{input_index}_producer_requires_exactly_one_Conv2d_weight"
+                    )
+                    continue
+                source_parameter_name = weights[0]
+                original_width = int(module.out_channels)
+                active_source_names = sorted(
+                    active_hits_by_slot.get(input_index, set())
+                )
+                if active_source_names and source_parameter_name not in active_source_names:
+                    segment_errors.append(
+                        f"concat_input_{input_index}_topology_source_mismatch:"
+                        f"resolved_{source_parameter_name}_active_{active_source_names}"
+                    )
+                    continue
+                # 一个 Concat 合同由调用方指定的 source 触发，但同一 Concat 的
+                # 其他输入段也可能在“全量候选” profile 中作为独立输出轴被 HESSO
+                # 选中。若只传播显式 source 的零索引，消费者会保留已删段对应的
+                # 输入列，最终出现 producer 已变窄、consumer.in_channels 未同步的
+                # 静默 shape 错误。
+                #
+                # 因此对每个 segment 都无模型名地解析“唯一、输出宽度一致”的
+                # node-group owner。is_active_owner 仍只表达调用方显式 source，保证
+                # 既有审计语义不变；is_passive_output_owner 专用于物理构网阶段的
+                # 额外输入轴同步。不能唯一解析或逻辑组数不等于输出宽度时绝不猜测。
+                segment_owners = ownership_by_parameter.get(
+                    source_parameter_name, []
+                )
+                segment_owner = (
+                    segment_owners[0]
+                    if (
+                        len(segment_owners) == 1
+                        and int(segment_owners[0].get("logical_group_count", 0) or 0)
+                        == original_width
+                    )
+                    else None
+                )
+                is_active_owner = bool(active_source_names)
+                if is_active_owner and segment_owner is None:
+                    segment_errors.append(
+                        f"concat_input_{input_index}_active_owner_is_not_unique_output_axis"
+                    )
+                    continue
+                segments.append(
+                    {
+                        "input_index": input_index,
+                        "original_offset": offset,
+                        "original_width": original_width,
+                        "producer_node_id": str(upstream_conv.id),
+                        "producer_parameter_name": source_parameter_name,
+                        "producer_owner_node_group_id": (
+                            segment_owner.get("node_group_id")
+                            if segment_owner is not None
+                            else None
+                        ),
+                        "is_active_owner": is_active_owner,
+                        "is_passive_output_owner": bool(
+                            not is_active_owner and segment_owner is not None
+                        ),
+                        "owner_resolution": (
+                            "explicit_active_output_owner"
+                            if is_active_owner
+                            else "passive_unique_output_axis_owner"
+                            if segment_owner is not None
+                            else "not_a_unique_output_axis_owner"
+                        ),
+                    }
+                )
+                offset += original_width
+
+            consumers, consumer_errors = downstream_standard_convs(concat_node)
+            errors = sorted(set(segment_errors + consumer_errors))
+            if len(segments) != len(getattr(concat_node, "inputs", [])):
+                errors.append("concat_segment_ledger_incomplete")
+            active_source_names = sorted(
+                {
+                    source_name
+                    for source_names in active_hits_by_slot.values()
+                    for source_name in source_names
+                }
+            )
+            if not active_source_names:
+                errors.append("concat_contract_has_no_active_source_owner")
+            for consumer in consumers:
+                contract = {
+                    "contract": "segmented_concat_consumer_v1",
+                    "contract_id": (
+                        f"{concat_id}__to__{consumer['consumer_node_id']}"
+                    ),
+                    "concat_node_id": concat_id,
+                    "consumer_node_id": consumer["consumer_node_id"],
+                    "consumer_parameter_name": consumer["consumer_parameter_name"],
+                    "consumer_original_in_channels": consumer["consumer_in_channels"],
+                    "segments": [dict(segment) for segment in segments],
+                    "active_source_parameter_names": active_source_names,
+                    "status": "configured" if not errors else "unresolved",
+                    "errors": errors,
+                }
+                contracts.append(contract)
+                for producer_name in active_source_names:
+                    source_coverage[producer_name].append(
+                        {
+                            "status": contract["status"],
+                            "contract_id": contract["contract_id"],
+                            "concat_node_id": concat_id,
+                            "consumer_parameter_name": consumer["consumer_parameter_name"],
+                            "errors": errors,
+                        }
+                    )
+
+        for producer_name in source_coverage:
+            source_coverage[producer_name] = sorted(
+                source_coverage[producer_name],
+                key=lambda item: (
+                    str(item.get("status", "")),
+                    str(item.get("contract_id", "")),
+                    str(item.get("reason", "")),
+                ),
+            )
+
+        self.segmented_concat_consumer_contracts = contracts
+        self.segmented_concat_contract_registration = {
+            "status": (
+                "configured"
+                if contracts and all(contract["status"] == "configured" for contract in contracts)
+                else "partial_or_unresolved"
+            ),
+            "contracts": contracts,
+            "source_coverage": source_coverage,
+        }
+        return self.segmented_concat_contract_registration
 
     def get_node_groups_by_param_name(self, param_name=''):
         """

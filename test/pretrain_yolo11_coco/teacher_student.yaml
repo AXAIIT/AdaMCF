@@ -1,0 +1,34 @@
+﻿experiment_id: "teacher_student_v1"
+config_status: placeholder_not_verified
+dataset:
+  train_manifest: "projects/06_model_compression/configs/inputs/train_manifest.yaml"
+  val_manifest: "projects/06_model_compression/configs/inputs/val_manifest.yaml"
+  fixed_input_set_manifest: "projects/06_model_compression/configs/inputs/edge_input_set.yaml"
+  dataset_id: null
+teacher:
+  name: "yolo11n_unpruned"
+  checkpoint: "models/yolo11n/source/yolo11n.pt"
+  hash: null
+  metric_name: "mAP"
+  role: "frozen_teacher_for_pruned_students"
+student:
+  name: "yolo11n_unpruned"
+  checkpoint: "models/yolo11n/source/yolo11n.pt"
+  hash: null
+  metric_name: "mAP"
+  role: "unpruned_student_baseline"
+role_relationship:
+  same_unpruned_checkpoint_required: true
+  distillation_student_source: "models/compressed/pruned/<prune_run_id>/best.pt"
+  distillation_student_ratios: [0.10, 0.30]
+quality_gate:
+  max_drop_vs_teacher_pct: 3.0
+  distilled_min_delta_vs_student_pct: 0.0
+edge_target:
+  min_p95_improvement_pct: 10.0
+  min_model_size_reduction_pct: 15.0
+export:
+  input_size: 640
+  opset: 12
+  dynamic: false
+  nms: false

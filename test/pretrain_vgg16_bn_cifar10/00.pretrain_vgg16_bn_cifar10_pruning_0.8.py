@@ -1,0 +1,359 @@
+import sys
+import os
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torchvision.datasets import CIFAR10
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from transformers import get_scheduler
+
+# 项目根目录
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+# 添加模型定义路径
+model_base_path = os.path.join(project_root, 'model')
+if model_base_path not in sys.path:
+    sys.path.insert(0, model_base_path)
+
+from only_train_once import OTO
+from model.vgg16_bn_cifar10 import VGG16_BN_CIFAR10, create_model as create_vgg_model
+
+def check_accuracy(model, loader):
+    model.eval()
+    num_correct = 0
+    num_samples = 0
+    top5_num_correct = 0
+    model_device = next(model.parameters()).device
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(model_device, non_blocking=True)
+            y = y.to(model_device, non_blocking=True)
+            scores = model(x)
+            _, predictions = scores.max(1)
+            num_correct += (predictions == y).sum().item()
+            num_samples += predictions.size(0)
+            _, top5_indices = scores.topk(5, dim=1)
+            y_reshaped = y.view(-1, 1)
+            top5_correct_batch = (top5_indices == y_reshaped).any(dim=1).sum().item()
+            top5_num_correct += top5_correct_batch
+    if num_samples == 0:
+        print("警告: check_accuracy 接收到的样本数量为0。")
+        return 0.0, 0.0
+    acc = float(num_correct) / num_samples * 100
+    top5_acc = float(top5_num_correct) / num_samples * 100
+    return acc, top5_acc
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用设备: {device}")
+
+    base_dir = os.path.dirname(__file__)
+    local_data_path = '/workspace/data/cifar10'
+    output_cache_dir = os.path.join(base_dir, 'cache_vgg16_bn_cifar10_pruned')
+    os.makedirs(output_cache_dir, exist_ok=True)
+
+    batch_size = 256                 # 保持原有batch size
+    num_workers = 36                 # 保持原有workers数
+
+    # --- 第 1 步：加载数据和预训练模型 ---
+    print("\n--- 第 1 步：加载数据和预训练模型 ---")
+    local_model_path = os.path.join(base_dir, 'model', 'ckpt.pth')
+    model = None
+    initial_accuracy = None
+
+    if os.path.exists(local_model_path):
+        print(f"尝试从本地路径 {local_model_path} 加载预训练模型...")
+        try:
+            model, initial_accuracy = create_vgg_model(num_classes=10, checkpoint_path=local_model_path)
+            model.to(device)
+            print(f"成功从本地路径 {local_model_path} 加载预训练权重。")
+            if initial_accuracy is not None:
+                print(f"从检查点加载的准确率: {initial_accuracy:.2f}%")
+        except Exception as e:
+            print(f"加载模型权重失败: {e}")
+            print("将使用随机初始化的 VGG16_BN_CIFAR10 模型。")
+            model = VGG16_BN_CIFAR10(num_classes=10).to(device)
+    else:
+        print(f"未找到预训练权重文件: {local_model_path}。")
+        model = VGG16_BN_CIFAR10(num_classes=10).to(device)
+    model.eval()
+
+    # --- 加载数据 ---
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2470, 0.2435, 0.2616])
+    ])
+    try:
+        testset = CIFAR10(root=local_data_path, train=False, download=False, transform=transform_test)
+        testloader = DataLoader(testset, batch_size=batch_size, shuffle=False,
+                                num_workers=num_workers, pin_memory=device.type == 'cuda')
+        print(f"成功加载 CIFAR-10 测试集，包含 {len(testset)} 张图片。")
+
+        trainset = CIFAR10(root=local_data_path, train=True, download=False, transform=transform_test)
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True,
+                                 num_workers=num_workers, pin_memory=device.type == 'cuda')
+        print(f"成功加载 CIFAR-10 训练集，包含 {len(trainset)} 张图片。")
+    except Exception as err:
+            print(err)
+
+    # --- 第 2 步：初始化 OTO ---
+    print("\n--- 第 2 步：初始化 OTO ---")
+    dummy_input = torch.rand(1, 3, 32, 32).to(device)
+    oto = OTO(model=model, dummy_input=dummy_input)
+    print("正在生成剪枝前的依赖图...")
+    oto.visualize(view=False, out_dir=output_cache_dir)
+
+    # --- 第 3 步：剪枝前评估 ---
+    print("\n--- 第 3 步：剪枝前评估 ---")
+    print("正在评估剪枝前模型的准确率...")
+    accuracy1_before, accuracy5_before = check_accuracy(model, testloader)
+    print(f"剪枝前准确率: Top-1: {accuracy1_before:.2f}%, Top-5: {accuracy5_before:.2f}%")
+
+    flops_before_m = oto.compute_flops(in_million=True)['total']
+    params_before_m = oto.compute_num_params(in_million=True)
+    print(f"剪枝前 FLOPs: {flops_before_m:.2f} M")
+    print(f"剪枝前参数量: {params_before_m:.2f} M")
+
+    original_model_size_bytes = 0
+    # 尝试获取本地模型文件的大小
+    if local_model_path and os.path.exists(local_model_path):
+        original_model_size_bytes = os.stat(local_model_path).st_size
+        print(f"原始模型文件大小: {original_model_size_bytes / (1024**2):.2f} MB")
+    else:
+        print("无法确定原始模型文件大小，权重文件未找到。")
+
+    # --- 第 4 步：使用 HESSO 进行剪枝和微调 ---
+    print("\n--- 第 4 步：使用 HESSO 进行剪枝和微调 ---")
+    
+    # 训练阶段参数
+    learning_rate = 2e-2             # 阶段一的初始学习率
+    finetune_lr = 2e-2               # 阶段二的微调学习率
+    num_train_epochs = 300           # 总训练周期
+    pruning_epochs = 100             # 剪枝阶段周期数
+    pruning_periods = 100            # 剪枝周期数
+    group_sparsity = 0.8             # 目标组稀疏率
+    lr_scheduler_type = "cosine"     # 学习率调度器类型
+    warmup_epochs = 0               # 热身阶段周期数
+    
+    finetune_epochs = num_train_epochs - warmup_epochs - pruning_epochs
+    num_update_steps_per_epoch = len(trainloader)
+    finetune_steps = finetune_epochs * num_update_steps_per_epoch
+    pruning_and_warmup_epochs = warmup_epochs + pruning_epochs
+    pruning_and_warmup_steps = pruning_and_warmup_epochs * num_update_steps_per_epoch
+    start_pruning_step = warmup_epochs * num_update_steps_per_epoch
+    pruning_steps = pruning_epochs * num_update_steps_per_epoch
+    
+
+    print(f"目标组稀疏率: {group_sparsity}")
+    print(f"总训练周期: {num_train_epochs} = {warmup_epochs}(热身) + {pruning_epochs}(剪枝) + {finetune_epochs}(微调)")
+    print(f"剪枝将在第 {start_pruning_step} 步开始，持续 {pruning_steps} 步。")
+
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer_prune = oto.hesso(
+        variant='sgd',
+        lr=learning_rate,
+        target_group_sparsity=group_sparsity,
+        start_pruning_step=start_pruning_step,
+        pruning_periods=pruning_periods,
+        pruning_steps=pruning_steps,
+        fixed_zero_groups=True,
+    )
+    lr_scheduler_prune = get_scheduler(
+        name=lr_scheduler_type,
+        optimizer=optimizer_prune,
+        num_warmup_steps=0,
+        num_training_steps=pruning_and_warmup_steps,
+    )
+
+    print("\n--- 开始预热与剪枝训练 ---")
+    progress_bar_prune = tqdm(range(pruning_and_warmup_steps), desc="[阶段一] 剪枝中")
+    model.train()
+    for epoch in range(pruning_and_warmup_epochs):
+        for inputs, targets in trainloader:
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer_prune.step()
+            lr_scheduler_prune.step()
+            optimizer_prune.zero_grad()
+            progress_bar_prune.update(1)
+            current_lr = optimizer_prune.param_groups[0]['lr']
+            progress_bar_prune.set_description(
+                f"[阶段一] Epoch {epoch+1}, Loss: {loss.item():.4f}, "
+                f"LR: {current_lr:.6f}"
+            )
+        metrics = optimizer_prune.compute_metrics()
+        print(f"\n[阶段一] Epoch {epoch+1}, Sparsity: {metrics.group_sparsity:.4f}")
+        
+        print(f"\n--- [阶段一] Epoch {epoch+1}/{pruning_and_warmup_epochs} 评估 ---")
+        model.eval()
+        accuracy1_epoch, accuracy5_epoch = check_accuracy(model, testloader)
+        print(f"Epoch {epoch+1} 测试准确率: Top-1: {accuracy1_epoch:.2f}%, Top-5: {accuracy5_epoch:.2f}%")
+        model.train()
+
+    print("\n--- 剪枝阶段完成，模型结构已固定 ---")
+
+    # --- 构建并加载子网络 ---
+    print("\n--- 构建并加载子网络用于微调 ---")
+    
+    oto.construct_subnet(out_dir=output_cache_dir)
+    compressed_model_path = oto.compressed_model_path
+    if not os.path.exists(compressed_model_path):
+        print(f"错误：压缩模型未在 {compressed_model_path} 找到。无法进行微调。")
+        return
+    
+    print(f"加载压缩后的模型从: {compressed_model_path}")
+    model = torch.load(compressed_model_path, map_location=device, weights_only=False)
+    model.to(device)
+    print("子网络加载完成，将用此模型进行微调。")
+
+    # --- 阶段二：微调 ---
+    print("\n--- 阶段二：微调 ---")
+    best_accuracy1 = 0.0
+    best_epoch = 0
+
+    optimizer_finetune = torch.optim.SGD(
+        model.parameters(),
+        lr=finetune_lr,
+        momentum=0.9,
+        weight_decay=5e-4
+    )
+
+    lr_scheduler_finetune = get_scheduler(
+        name=lr_scheduler_type,
+        optimizer=optimizer_finetune,
+        num_warmup_steps=0,
+        num_training_steps=finetune_steps,
+    )
+
+    print(f"将使用新的标准SGD优化器进行 {finetune_epochs} 个周期的微调。")
+
+    progress_bar_finetune = tqdm(range(finetune_steps), desc="[阶段二] 微调中")
+    model.train()
+    for epoch in range(finetune_epochs):
+        for inputs, targets in trainloader:
+            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer_finetune.step()
+            lr_scheduler_finetune.step()
+            optimizer_finetune.zero_grad()
+            progress_bar_finetune.update(1)
+            current_lr = optimizer_finetune.param_groups[0]['lr']
+            progress_bar_finetune.set_description(
+                f"[阶段二] Epoch {epoch+1+pruning_and_warmup_epochs}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}"
+            )
+        print(f"\n--- [阶段二] Epoch {epoch+1+pruning_and_warmup_epochs}/{num_train_epochs} 评估 ---")
+        model.eval()
+        accuracy1_epoch, accuracy5_epoch = check_accuracy(model, testloader)
+        print(f"Epoch {epoch+1+pruning_and_warmup_epochs} 测试准确率: Top-1: {accuracy1_epoch:.2f}%, Top-5: {accuracy5_epoch:.2f}%")
+
+        if accuracy1_epoch > best_accuracy1:
+            best_accuracy1 = accuracy1_epoch
+            best_epoch = epoch+1+pruning_and_warmup_epochs
+            print(f"当前最佳Top-1准确率: {best_accuracy1:.2f}% (Epoch {best_epoch})")
+            print(f"  - 保存模型到: {compressed_model_path}")
+            torch.save(model, compressed_model_path)
+
+        model.train()
+
+    print("剪枝和微调过程完成。")
+    print(f"\n--- 保存微调后的模型到: {compressed_model_path} ---")
+    print("模型保存成功。")
+
+    model.eval()
+    
+    print("\n--- 计算最终模型指标 ---")
+    final_metrics = optimizer_prune.compute_metrics()
+    final_group_sparsity = final_metrics.group_sparsity
+    print(f"  - 最终组稀疏度 (Final Group Sparsity): {final_metrics.group_sparsity:.4f}")
+    print(f"  - 总可剪枝组数 (Total Prunable Groups): {final_metrics.num_groups}")
+    print(f"  - 零权重组数 (Zero Groups): {final_metrics.num_zero_groups}")
+    print(f"  - 重要组数 (Important Groups): {final_metrics.num_important_groups}")
+    print(f"  - 冗余组数 (Redundant Groups): {final_metrics.num_redundant_groups}")
+    print(f"  - 总参数范数 (Total Param Norm): {final_metrics.norm_params:.2f}")
+
+    # --- 第 5 步：构建子网络并进行剪枝后评估 ---
+    print("\n--- 第 5 步：最终模型评估 ---")
+    compressed_model = model
+    accuracy1_after, accuracy5_after = check_accuracy(compressed_model, testloader)
+    print(f"剪枝后准确率: Top-1: {accuracy1_after:.2f}%, Top-5: {accuracy5_after:.2f}%")
+
+    flops_after_m = oto.compute_flops(in_million=True)['total']
+    params_after_m = oto.compute_num_params(in_million=True)
+    print(f"剪枝后 FLOPs: {flops_after_m:.2f} M")
+    print(f"剪枝后参数量: {params_after_m:.2f} M")
+
+    compressed_model_size_bytes = os.stat(oto.compressed_model_path).st_size if os.path.exists(oto.compressed_model_path) else 0
+    if compressed_model_size_bytes:
+        print(f"压缩模型文件大小: {compressed_model_size_bytes / (1024**2):.2f} MB")
+    else:
+        print("无法获取压缩模型文件大小。")
+
+    final_metrics = optimizer_prune.compute_metrics(
+        flops_before=flops_before_m,
+        flops_after=flops_after_m,
+        params_before=params_before_m,
+        params_after=params_after_m,
+    )
+    final_group_sparsity = final_metrics.group_sparsity
+
+    print("\n--- 计算最终模型指标 ---")
+    print(f"  - 最终组稀疏度 (Final Group Sparsity): {final_group_sparsity:.4f} ({final_group_sparsity * 100:.2f}%)")
+    print(f"  - 总可剪枝组数 (Total Prunable Groups): {final_metrics.num_groups}")
+    print(f"  - 零权重组数 (Zero Groups): {final_metrics.num_zero_groups} ({final_metrics.zero_group_ratio * 100:.2f}%)")
+    print(f"  - 已剪枝组数 (Pruned Groups): {final_metrics.num_pruned_groups} ({final_metrics.pruned_group_ratio * 100:.2f}%)")
+    print(f"  - 活跃冗余组数 (Active Redundant Groups): {final_metrics.num_active_redundant_groups} ({final_metrics.active_redundant_group_ratio * 100:.2f}%)")
+    print(f"  - 冗余组数 (Redundant Groups): {final_metrics.num_redundant_groups} ({final_metrics.redundant_group_ratio * 100:.2f}%)")
+    print(f"  - 重要组数 (Important Groups): {final_metrics.num_important_groups} ({final_metrics.important_group_ratio * 100:.2f}%)")
+    print(f"  - 总参数范数 (Total Param Norm): {final_metrics.norm_params:.2f}")
+
+    print("\n--- 第 6 步：压缩总结 ---")
+    print(f"最终剪枝率 (组稀疏率): {final_group_sparsity:.2f} ({final_group_sparsity * 100:.2f}%)")
+
+    pruned_flops_m = final_metrics.pruned_flops
+    pruned_params_m = final_metrics.pruned_params
+    pruned_flops_percent = final_metrics.pruned_flops_percent
+    pruned_params_percent = final_metrics.pruned_params_percent
+
+    print(f"减少的 FLOPs: {pruned_flops_m:.2f}M ({pruned_flops_percent:.2f}%)")
+    print(f"减少的参数量: {pruned_params_m:.2f}M ({pruned_params_percent:.2f}%)")
+
+    if final_metrics.flops_before > 0 and final_metrics.flops_after > 0:
+        print(f"FLOPs 压缩比: {final_metrics.flops_compression_ratio:.2f}x "
+              f"({final_metrics.flops_before:.2f}M -> {final_metrics.flops_after:.2f}M)")
+    else:
+        print(f"FLOPs 压缩比: N/A (剪枝前: {flops_before_m:.2f}M, 剪枝后: {flops_after_m:.2f}M)")
+
+    if final_metrics.params_before > 0 and final_metrics.params_after > 0:
+        print(f"参数量压缩比: {final_metrics.params_compression_ratio:.2f}x "
+              f"({final_metrics.params_before:.2f}M -> {final_metrics.params_after:.2f}M)")
+    else:
+        print(f"参数量压缩比: N/A (剪枝前: {params_before_m:.2f}M, 剪枝后: {params_after_m:.2f}M)")
+
+    if original_model_size_bytes > 0 and compressed_model_size_bytes > 0:
+        print(f"模型文件大小压缩比: {original_model_size_bytes / compressed_model_size_bytes:.2f}x "
+              f"({original_model_size_bytes / (1024**2):.2f}MB -> {compressed_model_size_bytes / (1024**2):.2f}MB)")
+    elif original_model_size_bytes > 0:
+        print(f"原始模型文件大小: {original_model_size_bytes / (1024**2):.2f} MB (压缩后模型大小未知)")
+    elif compressed_model_size_bytes > 0:
+        print(f"压缩模型文件大小: {compressed_model_size_bytes / (1024**2):.2f} MB (原始模型大小未知)")
+    else:
+        print("模型文件大小压缩比: N/A (无法获取原始或压缩后的模型大小)")
+
+    print(f"\n准确率变化: Top-1 从 {accuracy1_before:.2f}% 变为 {accuracy1_after:.2f}% (变化: {accuracy1_after - accuracy1_before:+.2f}%)")
+    print(f"准确率变化: Top-5 从 {accuracy5_before:.2f}% 变为 {accuracy5_after:.2f}% (变化: {accuracy5_after - accuracy5_before:+.2f}%)")
+
+    print("\n--- 第 7 步：导出压缩模型 ---")
+    print(f"压缩后的模型已保存在: {oto.compressed_model_path}")
+    print(f"完整的组稀疏模型 (未移除零权重组) 保存在: {oto.full_group_sparse_model_path}")
+    print("\n剪枝和压缩测试完成。")
+
+
+if __name__ == "__main__":
+    main()

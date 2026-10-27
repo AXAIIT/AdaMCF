@@ -3,7 +3,7 @@ from torch.optim.optimizer import Optimizer, required
 import torch 
 from .base_optimizer import BaseOptimizer  # 导入自定义的基础优化器类
 from .hyperparameter import DEFAULT_OPT_PARAMS, SUPPORT_GRADIENT_ESTIMATES  # 导入预定义的优化器参数和支持的梯度估计方法
-from only_train_once.transform import tensor_transformation, TensorTransform, index_transformation, index_transformation_param_group  # 导入张量变换相关函数
+from only_train_once.transform import tensor_transformation, TensorTransform, index_transformation, index_transformation_param_group, pruning_axis  # 导入张量变换相关函数
 from .importance_score import calculate_importance_score  # 导入计算重要性分数的函数
 import numpy as np  
 
@@ -139,14 +139,19 @@ class BaseHybridSparseOptimizer(BaseOptimizer):
                 # 转换剪枝索引以匹配参数的变换方式
                 pruned_idxes = index_transformation_param_group(param_group['pruned_idxes'], p_transform, param_group)
                 # 根据变换类型处理参数
-                if p_transform == TensorTransform.TRANSPOSE and len(p.data.shape) > 1:
+                if pruning_axis(p_transform) == 1 and len(p.data.shape) > 1:
                     p.data[:, pruned_idxes] = 0.0  # 对转置的参数设零
                 else:
                     p.data[pruned_idxes] = 0.0  # 对普通参数设零
                     
             # 处理相关的辅助参数
             for ng_id, offset in param_group['auxiliary_ngs']:
-                pruned_aux_idxes = [i + offset for i in pruned_idxes]  # 计算辅助参数中对应的索引
+                # auxiliary 节点传播的是逻辑组索引，不是当前参数经过 QKV/转置
+                # 展开后的物理索引。旧实现误用了循环中最后一个参数的物理索引。
+                logical_pruned_idxes = index_transformation_param_group(
+                    param_group['pruned_idxes'], TensorTransform.BASIC, param_group
+                )
+                pruned_aux_idxes = [i + offset for i in logical_pruned_idxes]
                 for aux_p in self.auxiliary_param_groups[ng_id]['params']:
                     if aux_p.grad is None:
                         continue

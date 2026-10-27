@@ -1,0 +1,57 @@
+{
+  "architecture": "resnet34",
+  "num_classes": 100,
+  "num_features": 512,
+  "pretrained_cfg": {
+    "num_classes": 100,
+    "input_size": [
+      3,
+      32,
+      32
+    ],
+    "pool_size": [
+      4,
+      4
+    ],
+    "crop_pct": 1,
+    "interpolation": "bilinear",
+    "fixed_input_size": false,
+    "mean": [
+      0.5071,
+      0.4867,
+      0.4408
+    ],
+    "std": [
+      0.2675,
+      0.2565,
+      0.2761
+    ],
+    "first_conv": "conv1",
+    "classifier": "fc"
+  },
+  "url": "https://huggingface.co/edadaltocg/resnet34_cifar100/resolve/main/pytorch_model.bin",
+  "input_size": [
+    3,
+    32,
+    32
+  ],
+  "pool_size": [
+    4,
+    4
+  ],
+  "crop_pct": 1,
+  "interpolation": "bilinear",
+  "fixed_input_size": false,
+  "mean": [
+    0.5071,
+    0.4867,
+    0.4408
+  ],
+  "std": [
+    0.2675,
+    0.2565,
+    0.2761
+  ],
+  "first_conv": "conv1",
+  "classifier": "fc"
+}

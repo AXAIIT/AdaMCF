@@ -1,0 +1,42 @@
+# 首次运行前的配置快照；尚无蒸馏结果，不得改为 verified。
+experiment_id: "20260726_yolo11n_all_verified_safe_p30_necksl2_kd_e80_v1"
+config_status: placeholder_not_verified
+teacher_student_config: "projects/06_model_compression/configs/teacher_student/teacher_student.yaml"
+seed: 42
+teacher:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt"
+  role: "unpruned_yolo11n_frozen"
+  sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+student:
+  source_pattern: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1_finetune1/weights/best.pt"
+  role: "finetuned_pruned_yolo11n"
+  prune_ratio_matrix: [0.10, 0.30]
+  minimum_required_ratio: 0.30
+  structure_sha256: "72bc0bf5f5ce97bfae2b3326097246ba9152bd449049d672d767b6d40ace8ed0"
+  source_sha256: "f35bc5eb8a2c67150c1f2203b1d7d6b9b8a32fcc4d451d1fb4e21f9a091e94ca"
+comparison_baseline: "same_ratio_finetuned_pruned_model"
+epochs: 80
+batch_size: 64
+optimizer:
+  name: "SGD"
+  learning_rate: 0.0005
+  momentum: 0.937
+  weight_decay: 0.0005
+distillation:
+  type: "feature"
+  # Neck-SL2 不使用 logits 温度；为满足通用 schema 记 1.0，运行代码不会读取它。
+  temperature: 1.0
+  loss_weights:
+    task: 1.0
+    logits: 0.0
+    feature: 3.0
+  method: "score_weighted_l2_detect_input_neck"
+  feature_levels: "Detect.f 动态读取的 P3/P4/P5"
+  projector: "Conv1x1(C_student,C_teacher) -> ReLU -> Conv1x1(C_teacher,C_teacher)"
+  feature_warmup_epochs: 5
+  projector_is_training_only: true
+  checkpoint_contract: "physical_student_only_v1"
+outputs:
+  checkpoint_dir: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260726_yolo11n_all_verified_safe_p30_necksl2_kd_e80_v1/weights/"
+  raw_train_dir: "benchmark/raw/06_model_compression/train/"
+  raw_eval_dir: "benchmark/raw/06_model_compression/eval/"

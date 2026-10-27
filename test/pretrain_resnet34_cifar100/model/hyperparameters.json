@@ -1,0 +1,22 @@
+{
+  "config": "scripts/train_configs/cifar100.json",
+  "model": "resnet34_cifar100",
+  "dataset": "cifar100",
+  "batch_size": 128,
+  "epochs": 300,
+  "validation_frequency": 5,
+  "seed": 1,
+  "criterion": "CrossEntropyLoss",
+  "criterion_kwargs": {},
+  "optimizer": "SGD",
+  "lr": 0.1,
+  "optimizer_kwargs": {
+    "momentum": 0.9,
+    "weight_decay": 0.0005
+  },
+  "scheduler": "CosineAnnealingLR",
+  "scheduler_kwargs": {
+    "T_max": 280
+  },
+  "debug": false
+}

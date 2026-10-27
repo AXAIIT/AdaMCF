@@ -20,7 +20,9 @@ from torch.onnx import (
     symbolic_helper                     # ONNX 导出的符号辅助函数
 )
 import textwrap                         # 用于处理文本换行
-from torch.onnx._globals import GLOBALS # ONNX 导出的全局配置
+from only_train_once.torch_compat import get_onnx_globals
+
+GLOBALS = get_onnx_globals()             # 按 PyTorch 版本选择的 ONNX 全局配置
 
 def _is_constant_tensor_list(node):
     """

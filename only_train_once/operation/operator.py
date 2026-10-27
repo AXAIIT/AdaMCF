@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from only_train_once.transform import TensorTransform, index_transformation # 导入张量变换相关的类
+from only_train_once.transform import TensorTransform, index_transformation, make_index_groups_transform # 导入张量变换相关的类
 from abc import ABC, abstractclassmethod # 导入抽象基类和抽象方法装饰器
 
 # 定义基础算子类，作为所有具体算子的父类
@@ -337,6 +337,12 @@ class Conv2dOTO(Operator):
             - 对于组卷积(groups=out_channels)的特殊情况有专门处理
             - 同时更新模块的out_channels属性和权重(以及偏置)参数
         """
+        original_in_channels = self.module.in_channels
+        original_out_channels = self.module.out_channels
+        original_groups = self.module.groups
+        is_true_depthwise = (
+            original_groups == original_in_channels == original_out_channels
+        )
         # 处理特殊情况：组卷积且组数等于输出通道数（如深度可分离卷积）
         if self.module.groups == self.module.out_channels:
             # 更新组数为剪枝后的输出通道数
@@ -346,6 +352,11 @@ class Conv2dOTO(Operator):
         preserved_idxes.sort()  # 对索引排序，保持相对顺序
         self.module.out_channels = self.module.out_channels - len(pruned_idxes)                 # 更新模块的输出通道数
         self.module.weight = self.prune_param_and_grad(self.module.weight, preserved_idxes, 0)  # 剪枝权重参数，在输出维度(dim=0)上进行剪枝
+        # 对真正的 depthwise Conv，输入通道、输出通道与 groups 是同一个物理轴。
+        # 旧逻辑仅更新 groups/out_channels，前向通常仍能通过，但模块元数据与后续
+        # FLOPs/结构合同不一致。该分支不影响普通卷积或一般 grouped Conv。
+        if is_true_depthwise:
+            self.module.in_channels = self.module.out_channels
         # 如果存在偏置，也对其进行剪枝
         if self.module.bias is not None:
             self.module.bias = self.prune_param_and_grad(self.module.bias, preserved_idxes, 0)
@@ -2293,6 +2304,362 @@ BASIC_MODULES = {
     'PReLU': PReLUOTO,                          # PReLU 激活函数 (带可学习参数)
 }
 
+def is_yolo11_conv_attention(module):
+    """判断同名 ``Attention`` 是否为 Ultralytics YOLO11 的卷积式实现。
+
+    ViT 的 ``qkv`` 为 ``nn.Linear``，具有 ``out_features``；YOLO11 的 ``qkv``、
+    ``proj``、``pe`` 则是 Ultralytics ``Conv`` 包装器，内部为 ``nn.Conv2d``。
+    以算子结构分派，避免仅按类名 ``Attention`` 错误匹配。
+    """
+    qkv = getattr(module, 'qkv', None)
+    proj = getattr(module, 'proj', None)
+    pe = getattr(module, 'pe', None)
+    return (
+        isinstance(getattr(qkv, 'conv', None), nn.Conv2d)
+        and isinstance(getattr(proj, 'conv', None), nn.Conv2d)
+        and isinstance(getattr(pe, 'conv', None), nn.Conv2d)
+        and hasattr(module, 'num_heads')
+        and hasattr(module, 'head_dim')
+        and not hasattr(qkv, 'out_features')
+    )
+
+
+class YOLO11AttentionOTO(Operator):
+    """YOLO11 卷积式 Attention 的 OTO 复合算子。
+
+    该模块的 Q/K/V 通道布局是 ``key_dim + key_dim + head_dim``，不同于 ViT 的
+    ``3 * embed_dim`` 线性布局，因此不能复用 ``VitAttentionOTO`` 的物理剪枝公式。
+    支持两种显式模式：``num_head`` 删除完整 Attention head；``head_dim`` 按
+    现有 OTO 语义删除所有 heads 中相同位置的 V/head 维，并同步 PE 与 proj 输入。
+    YOLO11 的 Q/K 使用独立 ``key_dim``，不应被混入 ``head_dim`` 模式。是否把该模块交给
+    HESSO 仍由调用侧 coverage profile 决定；OTO 核心不硬编码模型层名前缀或
+    Attention 黑名单。
+    """
+    def __init__(self, id=None, _type=None, cfg_params=dict(), module=None, model=None):
+        if not is_yolo11_conv_attention(module):
+            raise TypeError('YOLO11AttentionOTO 只能处理 Ultralytics YOLO11 的卷积式 Attention。')
+        super().__init__(id, _type, cfg_params, module)
+        self.root_model = model
+        self.num_heads = int(module.num_heads)
+        self.head_dim = int(module.head_dim)
+        self.key_dim = int(module.key_dim)
+        self.hidden_size = int(module.proj.conv.out_channels)
+        self.op_name = 'yolo11_attention'
+        # 旧 v3/v4 物理 checkpoint 只有 legacy 字段；在不改变运行开关的
+        # 前提下迁移 provenance，使其直接交给通用 OTO 再建图也不会丢信息。
+        if (
+            getattr(module, '_oto_dynamic_inner_attention', False)
+            and not hasattr(module, '_oto_attention_physical_mode')
+        ):
+            legacy_physical_mode = getattr(module, '_oto_attention_prune_mode', None)
+            if legacy_physical_mode in {'num_head', 'head_dim'}:
+                module._oto_attention_physical_mode = legacy_physical_mode
+        # ``active`` 只描述本次 OTO 建图是否开放结构化剪枝。物理子网保存的
+        # ``_oto_attention_physical_mode`` 是结构 provenance，不能被当作下一次
+        # 建图的默认剪枝开关，否则加载 structured checkpoint 后会意外二次剪枝。
+        self.prune_mode = str(
+            getattr(module, '_oto_attention_active_prune_mode', 'disabled')
+        )
+        if self.prune_mode not in {'disabled', 'num_head', 'head_dim'}:
+            raise ValueError(
+                'YOLO11 Attention prune_mode 必须为 disabled/num_head/head_dim，'
+                f'实际为 {self.prune_mode!r}。'
+            )
+        if self.head_dim <= 0 or self.key_dim <= 0 or self.num_heads <= 0:
+            raise ValueError('YOLO11 Attention 的 num_heads/key_dim/head_dim 必须为正数。')
+        self.num_groups = (
+            self.num_heads if self.prune_mode == 'num_head' else self.head_dim
+        ) if self.prune_mode != 'disabled' else 1
+        self.num_group_divisible = 1
+        self.is_basic = False
+        # OTO 只有把复合算子视为 stem 才会创建可剪参数组。这里的 stem 表示
+        # “内部逻辑组可独立压缩”，并不表示 Attention 的外部输出通道会改变。
+        self.is_stem = self.prune_mode != 'disabled'
+        # 两种模式都只压缩 Attention 内部瓶颈，proj 输出轴保持不变。
+        # 物理构建第二遍不得把逻辑冗余索引传播到模块外部，也不得再裁一次内部输入。
+        self.preserves_external_output_dim = True
+        self.handles_internal_input_pruning = True
+
+    def _physical_index_groups(self):
+        """返回当前模式下 QKV 与 V 路径的逻辑组到物理索引映射。"""
+        qkv_groups = []
+        value_groups = []
+        qkv_head_width = self.key_dim * 2 + self.head_dim
+        if self.prune_mode == 'num_head':
+            for head in range(self.num_heads):
+                qkv_start = head * qkv_head_width
+                value_start = head * self.head_dim
+                qkv_groups.append(list(range(qkv_start, qkv_start + qkv_head_width)))
+                value_groups.append(list(range(value_start, value_start + self.head_dim)))
+        elif self.prune_mode == 'head_dim':
+            # 对齐 BaseMultiHeadAttentionOTO：一个逻辑组就是每个 head 中相同
+            # 局部位置的一个 head/V 维。Q/K 的 key_dim 是独立轴，不随此模式改变。
+            for value_index in range(self.head_dim):
+                qkv_group = []
+                value_group = []
+                for head in range(self.num_heads):
+                    qkv_start = head * qkv_head_width
+                    qkv_group.append(qkv_start + self.key_dim * 2 + value_index)
+                    value_group.append(head * self.head_dim + value_index)
+                qkv_groups.append(qkv_group)
+                value_groups.append(value_group)
+        return qkv_groups, value_groups
+
+    def _parameter_transform(self, p_name, qkv_groups, value_groups):
+        if '.qkv.conv.' in p_name or '.qkv.bn.' in p_name:
+            return make_index_groups_transform(qkv_groups, axis=0)
+        if '.pe.conv.' in p_name or '.pe.bn.' in p_name:
+            return make_index_groups_transform(value_groups, axis=0)
+        if p_name.endswith('.proj.conv.weight'):
+            return make_index_groups_transform(value_groups, axis=1)
+        return None
+
+    def get_param_groups(self, param_names=list(), skip_output_node=False, **kwargs):
+        """声明 Attention 的参数所有权与逻辑组。
+
+        ``proj.conv.weight`` 同时具有两个不同角色：axis=0 是 Attention 的固定
+        外部输出，axis=1 是内部 V 通道的物理消费者。OTO 的 composed node group
+        会以 ``skip_output_node=True`` 获取用于 HESSO 置零和冗余判定的内部组；
+        此时必须排除 proj，否则外部固定组中的非零 proj 会掩盖已经置零的 qkv/pe
+        逻辑组。物理剪枝仍由 :meth:`prune_out_dim` 使用同一逻辑索引裁剪 proj
+        的 axis=1，因而不会丢失消费者联动。
+
+        BasicNodeGroup 会带 ``param_names`` 单独查询 proj 的外部参数所有权。由于
+        eval/ONNX trace 可能把 BatchNorm 折叠进 Conv，图节点通常只显式携带
+        ``proj.conv.weight``，但训练模型中 ``proj.bn.weight/bias`` 仍是可训练参数。
+        因此外部 proj 查询必须原子地接管 Conv 与其 BN 仿射参数，并全部返回
+        ``NO_PRUNE``。这样 proj 的输出轴保持固定、BN 仍正常训练，也不会混入
+        Attention 内部 HESSO 冗余范数。不带显式参数名且不跳过输出节点的调用
+        只保留 proj.conv 的 axis=1 索引变换，供算子物理合同测试使用。
+        """
+        param_groups = {
+            'op': self.op_name,
+            'p_names': [],
+            'params': [],
+            'p_transform': [],
+            'num_heads': self.num_heads,
+            'head_dim': self.head_dim,
+            'key_dim': self.key_dim,
+            'prune_mode': self.prune_mode,
+            'attention_contract': 'yolo11_partitioned_qkv_v1',
+        }
+        if self.prune_mode == 'disabled':
+            # “结构不可剪”不等于“参数不训练”。旧实现返回空组，会使 conservative
+            # 以及所有非 Attention profile 中的 qkv/proj/pe 参数从 HESSO optimizer
+            # 消失。这里仍声明参数所有权，但统一标为 NO_PRUNE；节点组本身因
+            # is_stem=False 保持不可剪，Graph 的全局去重继续保证每个 Parameter
+            # 只进入一个 optimizer group。
+            requested = set(param_names) if param_names else set(self.name_to_param)
+            for p_name, param in self.name_to_param.items():
+                if p_name not in requested or not param.requires_grad:
+                    continue
+                param_groups['p_names'].append(p_name)
+                param_groups['params'].append(param)
+                param_groups['p_transform'].append(TensorTransform.NO_PRUNE)
+            param_groups['parameter_role'] = (
+                'disabled_trainable_without_structural_pruning'
+            )
+            return param_groups
+        qkv_groups, value_groups = self._physical_index_groups()
+        explicit_parameter_selection = bool(param_names)
+        requested = set(param_names) if explicit_parameter_selection else set(self.name_to_param)
+
+        # ONNX eval trace 常把 proj.bn 折叠到 proj.conv，导致外部节点只携带
+        # proj.conv.weight。显式查询任一 proj 输出参数时，必须把 Conv 与 BN
+        # 仿射参数作为一个不可结构剪枝的原子所有权单元返回，避免 BN 参数从
+        # optimizer 中消失。该扩展仅作用于外部显式查询；内部 composed group
+        # 仍只包含 qkv/pe，确保 HESSO 冗余范数不受固定输出参数干扰。
+        external_proj_owner_query = explicit_parameter_selection and any(
+            p_name.endswith('.proj.conv.weight') or '.proj.bn.' in p_name
+            for p_name in requested
+        )
+        if external_proj_owner_query:
+            requested.update(
+                p_name
+                for p_name in self.name_to_param
+                if p_name.endswith('.proj.conv.weight') or '.proj.bn.' in p_name
+            )
+
+        for p_name, param in self.name_to_param.items():
+            if p_name not in requested or not param.requires_grad:
+                continue
+            is_proj_input_consumer = p_name.endswith('.proj.conv.weight')
+            is_proj_output_affine = '.proj.bn.' in p_name
+            if skip_output_node and (is_proj_input_consumer or is_proj_output_affine):
+                continue
+            if explicit_parameter_selection and (
+                is_proj_input_consumer or is_proj_output_affine
+            ):
+                transformation = TensorTransform.NO_PRUNE
+            else:
+                transformation = self._parameter_transform(p_name, qkv_groups, value_groups)
+            if transformation is None:
+                continue
+            param_groups['p_names'].append(p_name)
+            param_groups['params'].append(param)
+            param_groups['p_transform'].append(transformation)
+        if skip_output_node:
+            # 该调用来自 NodeGroupComposedOp，表示 qkv/pe 内部结构参数的唯一
+            # HESSO 所有者。OTO 依赖图中同一参数还可能出现在用于表达外部形状
+            # 约束的普通 NodeGroup；若继续按临时 node id 去重，普通组可能抢先
+            # 接管参数并使完整 head 组消失。显式优先级只作用于本 YOLO11
+            # Attention 内部合同，不改变其他复合算子、YOLOv5 或 ViT 的分组。
+            param_groups['parameter_role'] = 'qkv_pe_internal_structural_owner'
+            param_groups['parameter_ownership_priority'] = 100
+        elif external_proj_owner_query:
+            # 外部普通依赖组还可能包含 C2PSA.cv1/FFN residual 等相邻参数，
+            # 不能提高整个组的全局优先级，否则会改变无关参数的既有去重顺序。
+            # proj Conv+BN 不与内部 composed group 重叠，因此默认 priority=0
+            # 即可保证唯一所有权；只有 qkv/pe 内部结构组需要显式抢占。
+            param_groups['parameter_role'] = 'fixed_proj_output_conv_bn_owner'
+        return param_groups
+
+    @staticmethod
+    def _preserved_indexes(width, pruned_idxes):
+        pruned = {int(index) for index in pruned_idxes}
+        return [index for index in range(int(width)) if index not in pruned]
+
+    def _prune_conv_out(self, conv, pruned_idxes):
+        preserved = self._preserved_indexes(conv.out_channels, pruned_idxes)
+        conv.weight = self.prune_param_and_grad(conv.weight, preserved, 0)
+        if conv.bias is not None:
+            conv.bias = self.prune_param_and_grad(conv.bias, preserved, 0)
+        conv.out_channels = len(preserved)
+
+    def _prune_conv_in(self, conv, pruned_idxes):
+        preserved = self._preserved_indexes(conv.in_channels, pruned_idxes)
+        conv.weight = self.prune_param_and_grad(conv.weight, preserved, 1)
+        conv.in_channels = len(preserved)
+
+    def _prune_batch_norm(self, bn, pruned_idxes):
+        preserved = self._preserved_indexes(bn.num_features, pruned_idxes)
+        if bn.affine:
+            bn.weight = self.prune_param_and_grad(bn.weight, preserved, 0)
+            bn.bias = self.prune_param_and_grad(bn.bias, preserved, 0)
+        if bn.track_running_stats:
+            indexes = torch.as_tensor(preserved, dtype=torch.long, device=bn.running_mean.device)
+            bn.running_mean = torch.index_select(bn.running_mean, 0, indexes)
+            bn.running_var = torch.index_select(bn.running_var, 0, indexes)
+        bn.num_features = len(preserved)
+
+    def _validate_physical_contract(self):
+        """在任何原位切片前验证 YOLO11 Attention 的冻结结构合同。"""
+        qkv_width = self.num_heads * (self.key_dim * 2 + self.head_dim)
+        value_width = self.num_heads * self.head_dim
+        qkv_bn = getattr(self.module.qkv, 'bn', None)
+        pe_bn = getattr(self.module.pe, 'bn', None)
+        issues = []
+        if self.module.qkv.conv.out_channels != qkv_width:
+            issues.append(
+                f'qkv.out={self.module.qkv.conv.out_channels}, expected={qkv_width}'
+            )
+        if not isinstance(qkv_bn, nn.BatchNorm2d) or qkv_bn.num_features != qkv_width:
+            issues.append(
+                f'qkv.bn={type(qkv_bn).__name__}/{getattr(qkv_bn, "num_features", None)}, '
+                f'expected=BatchNorm2d/{qkv_width}'
+            )
+        pe_conv = self.module.pe.conv
+        if not (
+            pe_conv.in_channels == value_width
+            and pe_conv.out_channels == value_width
+            and pe_conv.groups == value_width
+        ):
+            issues.append(
+                f'pe(in/out/groups)={pe_conv.in_channels}/{pe_conv.out_channels}/'
+                f'{pe_conv.groups}, expected={value_width}/{value_width}/{value_width}'
+            )
+        if not isinstance(pe_bn, nn.BatchNorm2d) or pe_bn.num_features != value_width:
+            issues.append(
+                f'pe.bn={type(pe_bn).__name__}/{getattr(pe_bn, "num_features", None)}, '
+                f'expected=BatchNorm2d/{value_width}'
+            )
+        if self.module.proj.conv.in_channels != value_width:
+            issues.append(
+                f'proj.in={self.module.proj.conv.in_channels}, expected={value_width}'
+            )
+        if issues:
+            raise ValueError(
+                'YOLO11 Attention 物理合同预检失败；未执行任何切片：'
+                + '；'.join(issues)
+            )
+
+    def prune_out_dim(self, pruned_idxes=list(), **kwargs):
+        """物理删除 QKV、PE 与 proj 输入的对应通道，并更新 Attention 属性。"""
+        if self.prune_mode == 'disabled' or len(pruned_idxes) == 0:
+            return
+        logical_pruned = sorted(set(int(index) for index in pruned_idxes))
+        if logical_pruned[0] < 0 or logical_pruned[-1] >= self.num_groups:
+            raise IndexError(
+                f'YOLO11 Attention 逻辑剪枝索引越界：{logical_pruned}, '
+                f'num_groups={self.num_groups}。'
+            )
+        if len(logical_pruned) >= self.num_groups:
+            raise ValueError('YOLO11 Attention 至少必须保留一个 head/维度组。')
+
+        qkv_groups, value_groups = self._physical_index_groups()
+        qkv_pruned = sorted(
+            index for group in logical_pruned for index in qkv_groups[group]
+        )
+        value_pruned = sorted(
+            index for group in logical_pruned for index in value_groups[group]
+        )
+
+        self._validate_physical_contract()
+
+        # 保存物理剪枝前的结构属性。后续重载验证不仅检查 shape 能否运行，
+        # 还要证明 num_head 模式只改变 head 数、head_dim 模式只改变每头 V 维度。
+        # 对已结构化模型再次定向剪枝时保留第一次物理剪枝前的来源信息。
+        if not hasattr(self.module, '_oto_attention_original_num_heads'):
+            self.module._oto_attention_original_num_heads = int(self.num_heads)
+        if not hasattr(self.module, '_oto_attention_original_head_dim'):
+            self.module._oto_attention_original_head_dim = int(self.head_dim)
+        if not hasattr(self.module, '_oto_attention_original_key_dim'):
+            self.module._oto_attention_original_key_dim = int(self.key_dim)
+
+        # 物理剪枝发生时才惰性导入 Ultralytics 适配类，旧 OTO 项目不受依赖影响。
+        from .yolo11_attention import upgrade_yolo11_attention_module
+
+        upgrade_yolo11_attention_module(self.module, self.prune_mode)
+        self._prune_conv_out(self.module.qkv.conv, qkv_pruned)
+        self._prune_batch_norm(self.module.qkv.bn, qkv_pruned)
+        self._prune_conv_out(self.module.pe.conv, value_pruned)
+        self._prune_batch_norm(self.module.pe.bn, value_pruned)
+        self._prune_conv_in(self.module.proj.conv, value_pruned)
+
+        if self.prune_mode == 'num_head':
+            self.num_heads -= len(logical_pruned)
+            self.module.num_heads = self.num_heads
+        else:
+            self.head_dim -= len(logical_pruned)
+            self.module.head_dim = self.head_dim
+        inner_dim = self.num_heads * self.head_dim
+        self.module.pe.conv.in_channels = inner_dim
+        self.module.pe.conv.out_channels = inner_dim
+        self.module.pe.conv.groups = inner_dim
+        self.module.proj.conv.in_channels = inner_dim
+        self.module._oto_attention_original_output_dim = self.hidden_size
+        self.module._oto_attention_inner_dim = inner_dim
+        self.module._oto_attention_contract = 'yolo11_partitioned_qkv_v1'
+        self.module._oto_attention_physical_mode = self.prune_mode
+        # construct_subnet 完成后保存到 checkpoint 的默认运行开关必须关闭；若要
+        # 再剪一次，只能由调用侧 coverage profile 显式重新设置 active mode。
+        self.module._oto_attention_active_prune_mode = 'disabled'
+        # 与 OTO 既有 Conv/MHA 算子一致，node_group.num_groups 保留物理剪枝前
+        # 的逻辑组总数，供 redundancy/压缩率报告使用；真实新宽度记录在 module。
+        self.pruned_status['out_dim'] = True
+
+    def prune_in_dim(self, pruned_idxes=list(), **kwargs):
+        """Attention 外部输入/输出维度固定；两种模式只压缩内部瓶颈。"""
+        return
+
+
+def AttentionOTO(id=None, _type=None, cfg_params=dict(), module=None, model=None):
+    """为同名 Attention 按内部算子结构选择 YOLO11 或 ViT 分支。"""
+    if is_yolo11_conv_attention(module):
+        return YOLO11AttentionOTO(id, _type, cfg_params, module, model)
+    return VitAttentionOTO(id, _type, cfg_params, module, model)
+
+
 # 复合模块：包含多个子模块或需要特殊处理的模块，映射到特定的复合 OTO 算子类
 # 通常要求包含至少两个可训练变量的节点，以区别于简单的包装器
 # Key 是 PyTorch 模块的类名字符串，Value 是对应的 OTO 算子类
@@ -2304,7 +2671,8 @@ COMPOSED_MODULES = {
     'PhiMHA': PhiAttentionOTO,                          # Phi 多头注意力机制模块
     'LoraLinear': LoraLinearOTO,                        # 应用了 LoRA 的线性层
     'LoraEmbedding': LoraEmbeddingOTO,                  # 应用了 LoRA 的嵌入层
-    'Attention': VitAttentionOTO,                       # ViT 注意力机制模块 (timm 中的名称)
+    'Attention': AttentionOTO,                           # 按内部结构分派 YOLO11 / ViT Attention
+    'OTOPrunableYOLO11Attention': AttentionOTO,          # 物理子网重载/再次建图仍走同一结构分派
 }
 
 # 不支持剪枝或暂不支持的基础算子类型名称列表，如果某个计算图节点组包含这些类型的算子，该组可能被标记为不可剪枝
@@ -2315,6 +2683,5 @@ UNPRUNABLE_BASIC_OPERATORS = [
 # 不支持剪枝或暂不支持的复合算子类型名称列表，包含这些算子的节点组可能被标记为不可剪枝，特别是 LoRA 相关层，其结构通常不参与剪枝
 UNPRUNABLE_COMPOSED_OPERATORS = [
     'LoraLinearOTO',    # LoRA 线性层 (LoRA 参数通常固定或有特定优化策略，不参与结构剪枝)
-    'LoraEmbeddingOTO'  # LoRA 嵌入层 (同上)
+    'LoraEmbeddingOTO', # LoRA 嵌入层 (同上)
 ]
-

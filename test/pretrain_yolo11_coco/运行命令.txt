@@ -1,0 +1,1449 @@
+在服务器上按下面顺序执行。权重路径已替换为你给出的路径。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco
+
+test -f models/yolo11n.pt
+test -f coco2017_yolo11.yaml
+test -d /workspace/data/coco2017/images/train2017
+test -d /workspace/data/coco2017/images/val2017
+mkdir -p logs
+
+若上述数据路径不存在，只修改 `coco2017_yolo11.yaml` 中的 `path`。
+
+先做审计：
+
+python prune_yolo11_adamcf.py audit \
+  --weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt \
+  --imgsz 640 \
+  --device 0 \
+  --output runs \
+  --name 20260711_yolo11n_audit \
+  2>&1 | tee logs/20260711_yolo11n_audit.log
+
+审计通过后，启动 AdaMCF 结构化剪枝：
+
+python prune_yolo11_adamcf.py prune \
+  --weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt \
+  --epochs 50 \
+  --warmup-epochs 5 \
+  --prune-ratio 0.10 \
+  --group-divisible 8 \
+  --imgsz 640 \
+  --batch 8 \
+  --workers 8 \
+  --device 0 \
+  --output runs \
+  --name 20260711_yolo11n_adamcf_p10 \
+  2>&1 | tee logs/20260711_yolo11n_adamcf_p10.log
+
+剪枝完成后，微调物理子网：
+
+python prune_yolo11_adamcf.py finetune \
+  --weights runs/20260711_yolo11n_adamcf_p10/weights/yolo11_adamcf_structured.pt \
+  --epochs 80 \
+  --close-mosaic 20 \
+  --imgsz 640 \
+  --batch 8 \
+  --workers 8 \
+  --device 0 \
+  --output runs \
+  --name 20260711_yolo11n_adamcf_p10_finetune \
+  2>&1 | tee logs/20260711_yolo11n_adamcf_p10_finetune.log
+
+最后导出 ONNX：
+
+python prune_yolo11_adamcf.py export \
+  --weights runs/20260711_yolo11n_adamcf_p10_finetune/weights/best.pt \
+  --imgsz 640 \
+  --opset 12 \
+  --device 0 \
+  --export-output runs/20260711_yolo11n_adamcf_p10_finetune/yolo11n_adamcf_p10.onnx \
+  2>&1 | tee logs/20260711_yolo11n_adamcf_p10_export.log
+
+如果 `batch 8` 显存不足，先改为 `--batch 4`；`--oto-opset` 无需填写，默认是 16。
+
+
+完整命令：
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260713_yolo11n_adamcf_p10_div1 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+python -u prune_yolo11_adamcf.py audit \
+  --weights "$WEIGHTS" \
+  --imgsz 640 --device 0 \
+  --output runs --name "${RUN_ID}_audit" \
+  2>&1 | tee "logs/${RUN_ID}_audit.log" && \
+python -u prune_yolo11_adamcf.py prune \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --epochs 50 --warmup-epochs 5 \
+  --prune-ratio 0.10 --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 --no-amp \
+  --output runs --name "$RUN_ID" \
+  2>&1 | tee "logs/${RUN_ID}_prune.log" && \
+python -u prune_yolo11_adamcf.py finetune \
+  --weights "runs/${RUN_ID}/weights/yolo11_adamcf_structured.pt" \
+  --data "$DATA" \
+  --epochs 80 --close-mosaic 20 \
+  --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 --no-amp \
+  --output runs --name "${RUN_ID}_finetune" \
+  2>&1 | tee "logs/${RUN_ID}_finetune.log" && \
+python -u prune_yolo11_adamcf.py export \
+  --weights "runs/${RUN_ID}_finetune/weights/best.pt" \
+  --imgsz 640 --opset 12 --device 0 \
+  --export-output "runs/${RUN_ID}_finetune/yolo11n_adamcf_p10.onnx" \
+  2>&1 | tee "logs/${RUN_ID}_export.log"
+
+
+
+修改--group-divisible：
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco
+
+python -u prune_yolo11_adamcf.py prune \
+  --weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt \
+  --data /workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml \
+  --epochs 50 \
+  --warmup-epochs 5 \
+  --prune-ratio 0.10 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 8 \
+  --workers 8 \
+  --device 0 \
+  --no-amp \
+  --output runs \
+  --name 20260713_yolo11n_adamcf_p10_div1
+
+
+30% 组稀疏率完整流程（先等待当前 10% 实验结束）：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260714_yolo11n_adamcf_p30_div1 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+test -f "$WEIGHTS" && test -f "$DATA" && \
+python -u prune_yolo11_adamcf_p30.py audit \
+  --weights "$WEIGHTS" \
+  --imgsz 640 --device 0 \
+  --output runs --name "${RUN_ID}_audit" \
+  2>&1 | tee "logs/${RUN_ID}_audit.log" && \
+python -u prune_yolo11_adamcf_p30.py prune \
+  --weights "$WEIGHTS" --data "$DATA" \
+  --epochs 50 --warmup-epochs 5 \
+  --prune-ratio 0.30 --group-divisible 1 \
+  --structured-name yolo11n_adamcf_p30_structured.pt \
+  --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 --no-amp \
+  --output runs --name "$RUN_ID" \
+  2>&1 | tee "logs/${RUN_ID}_prune.log" && \
+python -u prune_yolo11_adamcf_p30.py finetune \
+  --weights "runs/${RUN_ID}/weights/yolo11n_adamcf_p30_structured.pt" \
+  --baseline-weights "$WEIGHTS" --data "$DATA" \
+  --epochs 80 --close-mosaic 20 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 --no-amp \
+  --output runs --name "${RUN_ID}_finetune" \
+  2>&1 | tee "logs/${RUN_ID}_finetune.log" && \
+python -u prune_yolo11_adamcf_p30.py export \
+  --weights "runs/${RUN_ID}_finetune/weights/best.pt" \
+  --imgsz 640 --opset 12 --device 0 \
+  --export-output "runs/${RUN_ID}_finetune/yolo11n_adamcf_p30.onnx" \
+  2>&1 | tee "logs/${RUN_ID}_export.log"
+
+
+复杂模块第一阶段：Bottleneck 隐藏通道审计与短程物理剪枝 probe
+
+说明：
+1. 保持 C3k2/C3k 的 split/concat 边界和 Bottleneck.cv2 输出不变。
+2. 只开放 Bottleneck.cv1 隐藏通道，并用 --module-probe-only 隔离其他基础可剪组。
+3. 先看 audit.json；只有 candidate group 非空、可剪且 tensor unsafe exclusions 为空，才运行 prune。
+4. 下面 10% 是候选 Bottleneck 隐藏组内的目标稀疏率，不等同于全模型 P10。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260715_yolo11n_bottleneck_hidden_v1 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+test -f "$WEIGHTS" && test -f "$DATA" && \
+python -u probe_yolo11_bottleneck_hidden.py audit \
+  --weights "$WEIGHTS" \
+  --imgsz 640 --device 0 \
+  --output runs --name "${RUN_ID}_audit" \
+  2>&1 | tee "logs/${RUN_ID}_audit.log" && \
+python -u probe_yolo11_bottleneck_hidden.py prune \
+  --weights "$WEIGHTS" --data "$DATA" \
+  --epochs 1 --warmup-epochs 0 --pruning-periods 1 \
+  --prune-ratio 0.10 --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 --no-amp \
+  --output runs --name "${RUN_ID}_probe" \
+  2>&1 | tee "logs/${RUN_ID}_probe.log"
+
+
+当前复杂模块主线：CSP/Detect 卷积依赖闭包审计与短程物理剪枝 probe
+
+说明：
+1. 开放 C3k2/C3k/Bottleneck、SPPF、前后常规 Conv 以及 Detect 隐藏层/输入适配支路。
+2. Attention 仍整体保护；Detect 只在 OTO 节点组级固定最终回归/分类输出维，最终卷积输入仍可跟随上游变化。
+3. --module-probe-only 在 OTO 组级隔离非候选组；Concat auxiliary 组继续传播索引。
+4. audit.json 中检查 dependency closure、fixed output groups、c3k2_chunk_source_quarantine 和 tensor unsafe exclusions；C3k2.cv1 chunk 源输出必须全部隔离，其他未识别 unsafe 必须失败。
+5. 已知隔离组不得超过候选组的 25%，并必须保留剩余可剪组；下面 10% 是隔离后的候选依赖闭包目标稀疏率。
+6. 短程 probe 通过前，不启动 50 epoch 正式实验。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260715_yolo11n_csp_dense_closure_v1 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+test -f "$WEIGHTS" && test -f "$DATA" && \
+python -u probe_yolo11_csp_dense_closure.py audit \
+  --weights "$WEIGHTS" \
+  --imgsz 640 --device 0 \
+  --output runs --name "${RUN_ID}_audit" \
+  2>&1 | tee "logs/${RUN_ID}_audit.log" && \
+python -u probe_yolo11_csp_dense_closure.py prune \
+  --weights "$WEIGHTS" --data "$DATA" \
+  --epochs 1 --warmup-epochs 0 --pruning-periods 1 \
+  --prune-ratio 0.10 --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 --no-amp \
+  --output runs --name "${RUN_ID}_probe" \
+  2>&1 | tee "logs/${RUN_ID}_probe.log"
+
+
+20260715 dense closure 失败 probe 的无训练恢复构建：
+
+说明：
+1. 输入必须是 OTO 保存的 DetectionModel_full_group_sparse.pt，不得换成 best.pt/last.pt。
+2. 新策略固定全部 C3k2.cv1 chunk 源和 self.m 动态 concat 直接子模块输出，内部隐藏卷积仍可物理删除。
+3. 输出使用独立 RUN_ID，不覆盖原始 probe 目录和三个既有模型产物。
+4. 成功标志是日志出现 forward_verified=True；随后再独立执行 COCO val。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+SOURCE_RUN=20260715_yolo11n_csp_dense_closure_v1_q5_probe && \
+RECOVERY_RUN=20260715_yolo11n_csp_dense_closure_v1_q5_rebuild_csp_boundary_v3 && \
+FULL_SPARSE="runs/${SOURCE_RUN}/oto_artifacts/DetectionModel_full_group_sparse.pt" && \
+test -f "$FULL_SPARSE" && \
+python -u probe_yolo11_csp_dense_closure.py rebuild-subnet \
+  --weights "$FULL_SPARSE" \
+  --imgsz 640 --device 0 --oto-opset 16 \
+  --output runs --name "$RECOVERY_RUN" \
+  2>&1 | tee "logs/${RECOVERY_RUN}.log"
+
+
+当前开放复杂模块：dense v3 同合同九段正式准入（一个命令）
+
+说明：
+1. 该命令会重新执行 audit -> 1 period HESSO -> 物理子网 -> 固定样本前向 -> task loss backward -> 1 epoch 微调 -> best.pt 独立重载 -> ONNX checker -> ORT 同输入对齐。
+2. audit 和稀疏训练必须产生相同 dependency contract SHA256；旧训练 + v3 recovery 不能拼接验收。
+3. 默认要求 C3k2/C3k/Bottleneck/SPPF/Detect 均出现真实物理命中；未命中会在最终 JSON 中列出，不能用候选资格代替。
+4. 固定输入使用 COCO val2017 的确定文件；运行前先确认该图片存在。
+5. 每个阶段保存独立日志，最终汇总为 runs/${RUN_ID}/nine_stage_admission.json。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260716_yolo11n_csp_dense_v3_admission_q10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -c "import torch, ultralytics, onnx, onnxruntime, cv2, numpy; print({'torch': torch.__version__, 'ultralytics': ultralytics.__version__, 'onnx': onnx.__version__, 'onnxruntime': onnxruntime.__version__, 'opencv': cv2.__version__, 'numpy': numpy.__version__})" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --prune-ratio 0.10 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+2026-07-20 Attention num_head v6 optimizer 所有权修复九阶段（当前推荐；复用已确认置零 1/2 head 的 full sparse，不重复稀疏训练）：
+
+修复范围：
+1. qkv/pe 由 NodeGroupComposedOp 作为唯一结构剪枝所有者，priority=100；防止普通依赖组因临时 node-* 排序抢占参数。
+2. proj.conv.weight 与 proj.bn.weight/bias 由外部固定输出组原子接管，保持默认 priority=0，全部为 NO_PRUNE；三者正常训练，但不参与 HESSO 结构评分和置零，也不改变相邻 cv1/FFN 参数的既有去重顺序。
+3. 任一参数组去重后若全部为 NO_PRUNE，会自动降级为不可剪组。
+4. audit 必须同时满足：canonical Attention 组 num_groups=2、missing=[]、duplicated=[]、proj 外部组不可剪。
+5. 先执行双模式、旧 P10/P30 checkpoint 与语法回归，再复用既有 full sparse 完成物理构网、反向、1 epoch 微调、best 重载、ONNX 与 ORT。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs runs/attention_contract_unit && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260720_yolo11n_attention_num_head_v6_ownerfix_p50 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+FULL_SPARSE=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260718_yolo11n_attention_num_head_v1_admission_p50_prune/oto_artifacts/DetectionModel_full_group_sparse.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$FULL_SPARSE" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+test -f /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260718_yolo11n_attention_num_head_v1_admission_p50_prune/adamcf_runtime.json && \
+python -m py_compile \
+  /workspace/OTOv2_v2/only_train_once/operation/operator.py \
+  /workspace/OTOv2_v2/only_train_once/graph/graph.py \
+  /workspace/OTOv2_v2/test/pretrain_yolo11_coco/prune_yolo11_adamcf.py \
+  /workspace/OTOv2_v2/test/pretrain_yolo11_coco/test_yolo11_attention_contract.py && \
+python -c "import torch, ultralytics, onnx, onnxruntime, cv2, numpy; print({'torch': torch.__version__, 'ultralytics': ultralytics.__version__, 'onnx': onnx.__version__, 'onnxruntime': onnxruntime.__version__, 'onnxruntime_providers': onnxruntime.get_available_providers(), 'opencv': cv2.__version__, 'numpy': numpy.__version__})" && \
+CUDA_VISIBLE_DEVICES=2 python -c "import torch; assert torch.cuda.is_available(); print({'logical_gpu': 0, 'physical_gpu': 2, 'name': torch.cuda.get_device_name(0)})" && \
+CUDA_VISIBLE_DEVICES=2 python -u test_yolo11_attention_contract.py \
+  --weights "$WEIGHTS" \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260713_yolo11n_adamcf_p10_div1/weights/yolo11_adamcf_structured.pt \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260713_yolo11n_adamcf_p10_div1_finetune/weights/best.pt \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260714_yolo11n_adamcf_p30_div1/weights/yolo11n_adamcf_p30_structured.pt \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260715_yolo11n_adamcf_p30_div1_finetune/weights/best.pt \
+  --device cuda:0 \
+  --output runs/attention_contract_unit/attention_two_modes_v6_ownerfix_compat.json \
+  2>&1 | tee logs/20260720_yolo11n_attention_two_modes_v6_ownerfix_compat.log && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --rebuild-from-full-sparse "$FULL_SPARSE" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_attention_num_head_v1_experimental \
+  --probe-module-family YOLO11_ATTN_NUM_HEAD \
+  --required-hit-family YOLO11_ATTN_NUM_HEAD \
+  --prune-ratio 0.50 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+2026-07-19 Attention num_head v5 稳定语义恢复九阶段（历史命令；复用已确认置零 1/2 head 的 full sparse，不重复稀疏训练）：
+
+说明：
+1. 先跑更新后的双模式快速合同；同时加载已完成的 P10/P30 structured 与 finetune 权重，验证旧模型前向以及 disabled Attention 仍完整进入 optimizer 所有权。
+2. 九阶段编排仍重新执行 v5 audit；stage 2 的零权重来自不可变 full sparse。rebuild 用稳定参数语义核对源 adamcf_runtime.json，临时 node-* 只作诊断，不参与跨 trace 身份。
+3. stage 3 重新物理构网并强制检查 num_heads=1、qkv=128、PE=64、proj.in=64、proj.out=128；随后重新执行固定输入、真实 loss 反向、1 epoch 微调、best 重载、ONNX 和 CPU ORT。
+4. 使用新 RUN_ID，不覆盖历史 audit fail、v3 稀疏训练或失败 compressed 产物。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs runs/attention_contract_unit && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260719_yolo11n_attention_num_head_v5_rebuild_p50 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+FULL_SPARSE=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260718_yolo11n_attention_num_head_v1_admission_p50_prune/oto_artifacts/DetectionModel_full_group_sparse.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$FULL_SPARSE" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+test -f /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260718_yolo11n_attention_num_head_v1_admission_p50_prune/adamcf_runtime.json && \
+python -c "import torch, ultralytics, onnx, onnxruntime, cv2, numpy; print({'torch': torch.__version__, 'ultralytics': ultralytics.__version__, 'onnx': onnx.__version__, 'onnxruntime': onnxruntime.__version__, 'onnxruntime_providers': onnxruntime.get_available_providers(), 'opencv': cv2.__version__, 'numpy': numpy.__version__})" && \
+CUDA_VISIBLE_DEVICES=2 python -c "import torch; assert torch.cuda.is_available(); print({'logical_gpu': 0, 'physical_gpu': 2, 'name': torch.cuda.get_device_name(0)})" && \
+CUDA_VISIBLE_DEVICES=2 python -u test_yolo11_attention_contract.py \
+  --weights "$WEIGHTS" \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260713_yolo11n_adamcf_p10_div1/weights/yolo11_adamcf_structured.pt \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260713_yolo11n_adamcf_p10_div1_finetune/weights/best.pt \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260714_yolo11n_adamcf_p30_div1/weights/yolo11n_adamcf_p30_structured.pt \
+  --compat-weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260715_yolo11n_adamcf_p30_div1_finetune/weights/best.pt \
+  --device cuda:0 \
+  --output runs/attention_contract_unit/attention_two_modes_v5_compat.json \
+  2>&1 | tee logs/20260719_yolo11n_attention_two_modes_v5_compat.log && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --rebuild-from-full-sparse "$FULL_SPARSE" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_attention_num_head_v1_experimental \
+  --probe-module-family YOLO11_ATTN_NUM_HEAD \
+  --required-hit-family YOLO11_ATTN_NUM_HEAD \
+  --prune-ratio 0.50 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+Attention num_head canonical-role v3：先只重跑 audit（保留首次失败 run，不覆盖）：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260718_yolo11n_attention_num_head_v1_admission_p50_rolefix_v3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_attention_num_head_v1_experimental \
+  --probe-module-family YOLO11_ATTN_NUM_HEAD \
+  --required-hit-family YOLO11_ATTN_NUM_HEAD \
+  --prune-ratio 0.50 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  --stop-after audit \
+  2>&1 | tee "logs/${RUN_ID}_audit_only.log"
+
+
+上面的 v3 audit 确认通过后，从 prune 继续完成 num_head 剩余九阶段：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260718_yolo11n_attention_num_head_v1_admission_p50_rolefix_v3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_attention_num_head_v1_experimental \
+  --probe-module-family YOLO11_ATTN_NUM_HEAD \
+  --required-hit-family YOLO11_ATTN_NUM_HEAD \
+  --prune-ratio 0.50 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  --start-stage prune \
+  2>&1 | tee "logs/${RUN_ID}_resume_from_prune.log"
+
+
+Attention 两种 OTO 合同快速测试（20260718 已通过；以下保留为回归命令）：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs runs/attention_contract_unit && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+test -f "$WEIGHTS" && \
+test -f /workspace/OTOv2_v2/only_train_once/operation/yolo11_attention.py && \
+python -c "import only_train_once; from only_train_once.operation import yolo11_attention; print({'oto_package': only_train_once.__file__, 'yolo11_attention': yolo11_attention.__file__})" && \
+CUDA_VISIBLE_DEVICES=2 python -u test_yolo11_attention_contract.py \
+  --weights "$WEIGHTS" \
+  --device cuda:0 \
+  --output runs/attention_contract_unit/attention_two_modes.json \
+  2>&1 | tee logs/20260718_yolo11n_attention_two_modes_unit.log
+
+
+Attention 完整 head（num_head）首次九阶段命令（历史 audit 失败，产物保留；不要用同一 RUN_ID 重跑）：
+
+说明：YOLO11n 只有 2 个 heads，本命令固定 P50，确保 HESSO 真实删除 1 个完整 head；这不是保守方案 P50。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260718_yolo11n_attention_num_head_v1_admission_p50 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+test -f /workspace/OTOv2_v2/only_train_once/operation/yolo11_attention.py && \
+python -c "import only_train_once; from only_train_once.operation import yolo11_attention; print({'oto_package': only_train_once.__file__, 'yolo11_attention': yolo11_attention.__file__})" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_attention_num_head_v1_experimental \
+  --probe-module-family YOLO11_ATTN_NUM_HEAD \
+  --required-hit-family YOLO11_ATTN_NUM_HEAD \
+  --prune-ratio 0.50 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+Attention head_dim（所有 heads 的同一 V 维）独立九阶段准入：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260718_yolo11n_attention_head_dim_v1_admission_p10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+test -f /workspace/OTOv2_v2/only_train_once/operation/yolo11_attention.py && \
+python -c "import only_train_once; from only_train_once.operation import yolo11_attention; print({'oto_package': only_train_once.__file__, 'yolo11_attention': yolo11_attention.__file__})" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_attention_head_dim_v1_experimental \
+  --probe-module-family YOLO11_ATTN_HEAD_DIM \
+  --required-hit-family YOLO11_ATTN_HEAD_DIM \
+  --prune-ratio 0.10 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+YOLO11 实验 guard 留在 profile 后的全局九阶段回归：
+
+说明：
+1. 本次不使用 --probe-module-family，仍审计和训练完整 dense closure 候选空间。
+2. 必须命中 C3k2/C3k/Bottleneck/Detect/standalone_or_boundary_Conv2d；SPPF 已由 20260718 定向九阶段独立验证，本回归不要求随机全局搜索再次命中它。
+3. audit 应保持 57 个候选依赖组、11 个去重 CSP 边界保护组、7 个 Detect/DFL 固定输出组，且没有未分类 tensor unsafe；如有漂移立即停止，不沿用旧 contract。
+4. 模块对象级节点组保护、定向候选隔离、tensor transform fail-closed 预检和候选交集统计均留在 YOLO11 测试脚本；OTO/HESSO 核心未加入这些实验保护 API。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260718_yolo11n_csp_dense_v4_profile_local_guard_q10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -c "import torch, ultralytics, onnx, onnxruntime, cv2, numpy; print({'torch': torch.__version__, 'ultralytics': ultralytics.__version__, 'onnx': onnx.__version__, 'onnxruntime': onnxruntime.__version__, 'opencv': cv2.__version__, 'numpy': numpy.__version__})" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --required-hit-family C3k2 \
+  --required-hit-family C3k \
+  --required-hit-family Bottleneck \
+  --required-hit-family Detect \
+  --required-hit-family standalone_or_boundary_Conv2d \
+  --prune-ratio 0.10 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+已完成的 SPPF 定向九段闭环复现命令（当前冻结版本结果 9/9 pass）：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+RUN_ID=20260718_yolo11n_sppf_v3_admission_q10_scopefix && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights /workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt \
+  --data /workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml \
+  --fixed-input /workspace/data/coco2017/images/val2017/000000000139.jpg \
+  --run-id "$RUN_ID" \
+  --probe-module-family SPPF --required-hit-family SPPF \
+  --prune-ratio 0.10 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+下一阶段：PSABlock FFN 隐藏维定向九段准入（Attention QKV/head/PE 仍不开放）：
+
+说明：
+1. 新 profile 是累计 profile，但 --probe-module-family PSA_FFN 会把本次 HESSO 候选收窄到 PSABlock.ffn.0 的完整 OTO 依赖组。
+2. audit 会先输出 candidate_profile_guard_overlap；若 ffn.0 被 Attention、C2PSA 边界或 ffn.1 残差输出保护连带封闭，会立即失败且不进入训练。
+3. C2PSA.cv1 split 源、C2PSA.cv2 concat 输出、整个 Attention、ffn.1 输出、C3k2 已知边界和 Detect 最终语义输出继续由测试 profile 固定；这些保护没有写入 OTO 核心。
+4. 只有 PSA_FFN 依赖组被 HESSO 真实置零，并完成物理子网、前向、反向、1 epoch、best 重载、ONNX 和 ORT，报告才会为 pass。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260718_yolo11n_psa_ffn_hidden_v1_admission_q10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile csp_psa_ffn_closure_v1_experimental \
+  --probe-module-family PSA_FFN \
+  --required-hit-family PSA_FFN \
+  --prune-ratio 0.10 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+PSA_FFN 已完成产物的模块族标签修正报告（report-only，不重跑任何训练阶段）：
+
+说明：
+1. 原始 nine_stage_admission.json 必须保留；它记录了旧统计把 PSA_FFN 误标为 standalone Conv 后的历史 fail。
+2. 此命令只读取既有 audit/prune/finetune/export JSON，并写入独立 nine_stage_admission_reclassified_v2.json。
+3. 只有 contract 相同、单一 directed family、物理命中组完全属于 audit 候选组且带候选前缀时才会重分类；不满足条件仍会 fail。
+4. 不需要 CUDA，不会重新建图、HESSO、构建子网、微调或导出。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+RUN_ID=20260718_yolo11n_psa_ffn_hidden_v1_admission_q10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+REPORT=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/${RUN_ID}/nine_stage_admission_reclassified_v2.json && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile csp_psa_ffn_closure_v1_experimental \
+  --probe-module-family PSA_FFN \
+  --required-hit-family PSA_FFN \
+  --output runs --logs logs \
+  --start-stage report --stop-after report \
+  --report-output "$REPORT" \
+  2>&1 | tee "logs/${RUN_ID}_report_reclassified_v2.log"
+
+
+下一阶段：C2PSA.cv2 输出边界定向九段准入（cv1 split 与 Attention 仍固定）：
+
+说明：
+1. 本阶段新增开放 model.10.cv2.conv，并与已经验证的 PSABlock.ffn.0 共同组成中等范围候选池，验证 C2PSA 内部/输出两个安全闭包的共同搜索。
+2. C2PSA.cv1 是 split 源，仍保持固定；不会触碰 QKV、head_dim、num_heads、PE depthwise 或 FFN 残差输出。
+3. audit 必须显示 C2PSA_OUTPUT 和 PSA_FFN 候选保护前后仍可剪；若被后继 C3k2 或 Attention 边界保护连带封闭，立即停止，不进入训练。
+4. C2PSA_OUTPUT 是本轮强制新命中族；PSA_FFN 已有独立九阶段证据，不强制本次随机搜索重复命中。
+5. 剪枝结束后立即执行早停门禁；若 C2PSA_OUTPUT 未真实命中，不再浪费时间运行微调和导出。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+mkdir -p logs && \
+set -o pipefail && \
+RUN_ID=20260718_yolo11n_c2psa_output_v1_admission_q10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c2psa_output_closure_v1_experimental \
+  --probe-module-family C2PSA_OUTPUT \
+  --probe-module-family PSA_FFN \
+  --required-hit-family C2PSA_OUTPUT \
+  --prune-ratio 0.10 --group-divisible 1 --lr0 0.001 \
+  --imgsz 640 --batch 8 --workers 8 --device 0 \
+  --export-device cpu \
+  --oto-opset 16 --opset 12 \
+  --output runs --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+下一阶段：全部 C3k2 根部 cv1 paired-chunk 定向 L3 验证：
+
+说明：
+1. 一次性开放 model.2/4/6/8/13/16/19/22.cv1，不再逐个模块测试。
+2. 每个逻辑位置同步裁剪两个 chunk、所有 self.m 外部输出和最终 cv2 concat 输入；cv2 外部输出固定。
+3. C3k 型独立 child-output 动态 concat 轴仍保持隔离，这是完成全部 cv1 后的下一开放范围。
+4. 只运行 audit 和 prune；不执行微调、ONNX、ORT 或端侧测试。
+5. 薄封装自动生成 OTO 节点组图和算子图。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260721_yolo11n_c3k2_paired_chunk_v1_q10 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c3k2_paired_chunk_v1_experimental \
+  --probe-module-family C3K2_CHUNK \
+  --prune-ratio 0.10 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+
+当前阶段：全部 cv1 一次性开放综合 L3 验证：
+
+说明：
+1. 候选池覆盖模型中全部 *.cv1.conv，不再按 Bottleneck、C3k、C2PSA、C3k2 逐个执行 probe。
+2. C2PSA.cv1 使用 paired-split 合同；8 个 C3k2 根部 cv1 使用 paired-chunk 合同；普通 cv1 使用 OTO 原生依赖传播。
+3. 早停门禁要求 C2PSA_SPLIT 与 C3K2_CHUNK 都产生真实物理命中。
+4. Attention 内部 num_head/head_dim/key_dim、Detect 最终语义输出和 C3k2 child-output 独立动态 concat 轴保持固定。
+5. 只运行 audit 和 prune，不执行微调、ONNX、ORT 或端侧测试。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260721_yolo11n_all_cv1_open_v1_p50 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  probe_yolo11_all_cv1_open.py && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile yolo11_all_cv1_open_v1 \
+  --prune-ratio 0.50 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+
+下一阶段：C3k2 独立 child-output segmented dynamic concat 定向 L3 验证：
+
+说明：
+1. 一次性开放 model.6.m.0.cv3、model.8.m.0.cv3、model.22.m.0.cv3 三个真正独立的 child-output 组。
+2. 全部 C3k2 根部 cv1/chunk 轴保持固定；5 个与根部组共享所有权的 Bottleneck child-output 继续保护。
+3. 外层 cv2 输入删除索引根据两个 chunk 和所有前序 child 的当前宽度动态计算，不使用固定原始 offset。
+4. 早停门禁要求 3 个独立 C3K2_DYNAMIC_CONCAT child-output 全部真实命中，并验证 checkpoint 重载、640 前向和 segment 结构账本。
+5. 该 profile 共 320 个逻辑组；P85 理论目标约 272 组，即使参考上一轮离散调度少约 3 组仍约为 269，高于任意两个候选组最多可删除的 254 组，用于强制三组全部命中。
+6. 只运行 audit 和 prune，不执行微调、ONNX、ORT 或端侧测试；薄封装自动生成 OTO 图。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260721_yolo11n_c3k2_dynamic_concat_v1_p85 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  probe_yolo11_c3k2_dynamic_concat.py && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c3k2_dynamic_concat_v1_experimental \
+  --probe-module-family C3K2_DYNAMIC_CONCAT \
+  --prune-ratio 0.85 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+
+20260721 dynamic concat P50 linter 失败的无训练恢复：
+
+说明：
+1. 原 P50 已完成稀疏训练并保存 DetectionModel_full_group_sparse.pt，不重复训练。
+2. v13 使用 audit 冻结合同和真实通道宽度；父 C3k2 与 child C3k 使用不同 marker，旧同名 marker 只兼容读取。
+3. 未被 P50 选中的候选模块允许保持原宽；是否 3/3 命中由后置门禁单独判断。
+4. 恢复成功只证明 P50 物理结构自洽；正式 3/3 准入仍执行上面的 P85 新 run。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+SOURCE_RUN=20260721_yolo11n_c3k2_dynamic_concat_v1_p50_prune && \
+RECOVERY_RUN=20260721_yolo11n_c3k2_dynamic_concat_v1_p50_rebuild_marker_v13 && \
+FULL_SPARSE="runs/${SOURCE_RUN}/oto_artifacts/DetectionModel_full_group_sparse.pt" && \
+test -f "$FULL_SPARSE" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  probe_yolo11_c3k2_dynamic_concat.py && \
+CUDA_VISIBLE_DEVICES=2 python -u probe_yolo11_c3k2_dynamic_concat.py rebuild-subnet \
+  --weights "$FULL_SPARSE" \
+  --prune-ratio 0.50 \
+  --group-divisible 1 \
+  --imgsz 640 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --name "$RECOVERY_RUN" \
+  2>&1 | tee "logs/${RECOVERY_RUN}.log"
+
+
+2026-07-22：DynamicConcat P85 的完整九段准入（替代上方仅 L3 的 P85 命令；二选一运行）：
+
+说明：
+1. P85 用于强制三个独立 child-output 都在同一 HESSO run 中产生真实物理命中。
+2. 本命令继续完成 1 epoch 微调、best.pt 独立重载、ONNX checker 和 CPU ORT 固定输入对齐；所有产物使用新 RUN_ID，不覆盖 P50 或历史 recovery。
+3. 若 P85 因 3/3 门禁在 prune 阶段失败，后续阶段不会运行；请同步 audit/prune JSON、post_prune_gate.json 和日志，而不是重跑覆盖。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_c3k2_dynamic_concat_v1_p85_l4 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  probe_yolo11_c3k2_dynamic_concat.py && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c3k2_dynamic_concat_v1_experimental \
+  --probe-module-family C3K2_DYNAMIC_CONCAT \
+  --required-hit-family C3K2_DYNAMIC_CONCAT \
+  --prune-ratio 0.85 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --export-device cpu \
+  --oto-opset 16 \
+  --opset 12 \
+  --output runs \
+  --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+
+
+2026-07-22：C3k2 composite 剪枝-only L3 的独立 audit 补验（不训练、不微调、不导出）：
+
+说明：
+1. 20260722 composite P50 的 prune 产物已经通过物理构网、checkpoint 重载和后置门禁；
+   但此前保存的独立 audit.json 产生于 audit 语义白名单修复之前，需用当前代码生成一份干净审计证据。
+2. 本命令只建 OTO 图和写 audit.json，不触发 optimizer.step、微调、ONNX 或 ORT。
+3. 新入口会在图标签中显示参数量和 FLOPs；输出目录使用新的 RUN_ID，不覆盖已有 prune 产物。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_c3k2_composite_v1_p50_l3_reaudit && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  probe_yolo11_c3k2_composite.py && \
+CUDA_VISIBLE_DEVICES=2 python -u probe_yolo11_c3k2_composite.py audit \
+  --weights "$WEIGHTS" \
+  --imgsz 640 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --name "$RUN_ID" \
+  2>&1 | tee "logs/${RUN_ID}.log"
+
+
+下一阶段：全量联合安全集合剪枝-only L3（Attention num_head，先执行此命令）：
+
+说明：
+1. 联合纳入已通过适配的 dense/CSP/SPPF/Detect hidden、C2PSA 输出闭包、
+   C3k2 root paired-chunk + child DynamicConcat，以及 Attention 的完整 head 轴。
+2. Detect 的 nc/4×reg_max/DFL 语义输出、Attention proj 外部输出和未知边界仍固定。
+3. 各模块族不使用 --probe-module-family 强行定向；audit 会要求每个已验证模块族至少保留一个可剪组，
+   本轮 HESSO 只要求真实命中任意合法候选组，避免把全局重要性排序误变成定向实验。
+4. 只执行 audit → 1 epoch 稀疏训练/真实置零 → 物理子网 → 后置门禁；不会启动微调、导出或 ORT。
+5. OTO 图会以 SVG/PDF 输出，并显示参数量与 FLOPs。
+6. `...num_head_v2_p10_l3` 的首次尝试发现 C3k2 `cv2` 外部输出可被下游共享组连带裁剪；
+   当前代码已加入精确输出组 guard。本命令使用新的 `v3` run_id，必须从原始权重重新训练，不能复用该失败 run 的 full-sparse 权重。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_all_verified_safe_num_head_v3_external_output_guard_p10_l3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  probe_yolo11_all_verified_safe.py \
+  verify_yolo11_csp_dense_closure.py && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_num_head_v2_experimental \
+  --prune-ratio 0.10 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+
+当前运行：C3k2 `cv2` 输出—通用 Concat 段合同闭包，剪枝-only L3：
+
+说明：
+1. 此回归不使用 C3k2 `cv2` fixed-output guard；OTO 会同时审计参数组所有权和图拓扑。直连普通 Conv、直连 depthwise Conv 和 channel Concat→普通 Conv 都可被合同覆盖；Concat 消费者的 input-axis 根据各段的**原始** offset 合并后只裁一次。
+2. 只执行 audit → 单周期真实置零 → 物理子网 → checkpoint 重载/固定前向 → post-prune gate；不会进入微调、ONNX 或 ORT。
+3. `--prune-ratio 0.50` 仅用于强制产生足量真实物理命中，不作为质量或最终压缩配置。
+4. 残差、split/slice、无法确定 Concat 输入顺序或一般 grouped Conv 仍必须在 audit 中 fail-closed；这不是放宽安全门禁。
+
+先执行框架级无 YOLO 路径的单元回归；通过前不要执行 audit：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+mkdir -p logs runs/segmented_concat_contract_unit_v2 && \
+python -m py_compile \
+  /workspace/OTOv2_v2/only_train_once/graph/graph.py \
+  /workspace/OTOv2_v2/only_train_once/subnet_construction/pruning_compression.py \
+  test_segmented_concat_contract.py && \
+python -u test_segmented_concat_contract.py \
+  --output runs/segmented_concat_contract_unit_v2 \
+  2>&1 | tee logs/20260722_segmented_concat_contract_unit_v2.log
+
+预期：`branch_a(4)` 与 `branch_b(5)` 分别删除 `{1,3}`、`{0,4}` 后，消费者输入从 `9→5`，删除的原始坐标为 `[1,3,4,8]`；子网前向、反向和一次 optimizer step 均通过，并写出 `segmented_concat_contract_unit.json`。若失败，只同步该 JSON（如有）和日志，不进入 YOLO11。
+
+单元回归通过后执行 audit-only：
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_c3k2_output_closure_v4_segmented_concat_audit && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  /workspace/OTOv2_v2/only_train_once/graph/graph.py \
+  /workspace/OTOv2_v2/only_train_once/operation/operator.py \
+  /workspace/OTOv2_v2/only_train_once/subnet_construction/pruning_compression.py \
+  prune_yolo11_adamcf.py \
+  probe_yolo11_c3k2_output_closure.py \
+  test_segmented_concat_contract.py \
+  verify_yolo11_csp_dense_closure.py && \
+python -c "import inspect; from only_train_once.graph.graph import Graph; from only_train_once.subnet_construction.pruning_compression import apply_segmented_concat_consumer_contracts; source = inspect.getsourcefile(Graph); a = callable(getattr(Graph, 'output_consumer_closure_records', None)); b = callable(getattr(Graph, 'discover_output_consumer_closures', None)); c = callable(getattr(Graph, 'register_segmented_concat_consumer_contracts', None)); print({'graph_source': source, 'ownership_api': a, 'topology_api': b, 'segmented_concat_registration_api': c, 'segmented_concat_executor': callable(apply_segmented_concat_consumer_contracts)}); assert a and b and c, f'未加载新版 Graph：{source}'" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c3k2_output_consumer_closure_v1_experimental \
+  --prune-ratio 0.50 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after audit \
+  2>&1 | tee "logs/${RUN_ID}_audit.log"
+
+预期 audit：8 个 C3k2 `cv2` 生产者—消费者合同均为 `configured_resolved_consumer_closure`；`model.4/6/13.cv2` 的每条 Concat 边界均应对应 `segmented_concat_consumer_v1` 合同。若出现 unresolved、重复消费者 input-axis 所有权、消费者原始宽度账本不闭合或候选被保护连带封闭，停止并同步新的 audit.json/日志，不进入 prune。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_c3k2_output_closure_v4_segmented_concat_p50_l3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  /workspace/OTOv2_v2/only_train_once/graph/graph.py \
+  /workspace/OTOv2_v2/only_train_once/subnet_construction/pruning_compression.py \
+  prune_yolo11_adamcf.py \
+  probe_yolo11_c3k2_output_closure.py \
+  verify_yolo11_csp_dense_closure.py && \
+python -c "import inspect; from only_train_once.graph.graph import Graph; source = inspect.getsourcefile(Graph); a = callable(getattr(Graph, 'output_consumer_closure_records', None)); b = callable(getattr(Graph, 'discover_output_consumer_closures', None)); c = callable(getattr(Graph, 'register_segmented_concat_consumer_contracts', None)); print({'graph_source': source, 'output_consumer_closure_api': a, 'output_consumer_topology_api': b, 'segmented_concat_registration_api': c}); assert a and b and c, f'未加载新版 Graph：{source}'" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c3k2_output_consumer_closure_v1_experimental \
+  --prune-ratio 0.50 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+
+历史命令（当前已豁免，不运行）：全量联合安全集合剪枝-only L3（Attention head_dim；在 num_head 通过后使用独立 RUN_ID 执行）：
+
+说明：
+1. 与上一命令的 dense/C2PSA 输出/C3k2 开放范围完全相同，仅把 Attention 内部所有权从完整 head
+   切换为所有 heads 共用的 V/head 维；两种轴绝不能在同一次 run 混用。
+2. 同样在 prune 后停止，不触发微调、导出或 ORT。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_all_verified_safe_head_dim_v2_p10_l3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  probe_yolo11_all_verified_safe.py \
+  verify_yolo11_csp_dense_closure.py && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_head_dim_v2_experimental \
+  --prune-ratio 0.10 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+
+历史命令（不要运行）：2026-07-22：C3k2 根部 PairedChunk + 独立 DynamicConcat 复合所有权完整九段准入：
+
+说明：
+1. 该 profile 同时开放 root paired-chunk 和 3 个独立 child-output；共享 Bottleneck child-output 仍由 root owner 管理。
+2. 父级 coordinator 在原始 cv2 输入坐标中合并全部 root/child 删除索引并一次性裁剪，防止同一列重复裁剪或 offset 漂移。
+3. 后置门禁要求 C3K2_CHUNK 与 C3K2_DYNAMIC_CONCAT 两个模块族均真实命中；复合 linter、重载、微调、ONNX 与 ORT 全部通过才会给出 9/9 pass。
+4. 此命令保留为历史九段模板；当前 composite P50 已按剪枝-only 完成，遵循上面的 re-audit 与全量联合 L3 命令，禁止在此处继续启动微调、ONNX 或 ORT。
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260722_yolo11n_c3k2_composite_v1_p50_l4 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  probe_yolo11_c3k2_composite.py && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile c3k2_paired_chunk_dynamic_concat_v1_experimental \
+  --probe-module-family C3K2_CHUNK \
+  --probe-module-family C3K2_DYNAMIC_CONCAT \
+  --required-hit-family C3K2_CHUNK \
+  --required-hit-family C3K2_DYNAMIC_CONCAT \
+  --prune-ratio 0.50 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --export-device cpu \
+  --oto-opset 16 \
+  --opset 12 \
+  --output runs \
+  --logs logs \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+推荐流程（2026-07-23）：全量联合 `num_head + C3k2 composite + output-consumer closure`，先审计、后 P30 剪枝-only L3
+
+说明：
+
+1. 新 profile 为 `all_verified_safe_num_head_v4_output_closure_experimental`。它保持 v2 已验证的 dense、PSA FFN、C2PSA 输出闭包、C3k2 PairedChunk/DynamicConcat 和 Attention `num_head` 候选；仅将 C3k2 `cv2` 的对外输出轴从历史临时 guard 交给通用 output-consumer closure。
+2. 审计必须同时通过：全部 C3k2 输出生产者闭包、3 个通用 segmented-concat 合同、C3k2 `cv2` 输出轴与 root/child `cv2` 输入协调器的所有权不重叠，以及旧 Detect 语义输出 guard 仍有效。
+3. 第二条命令以 P30、`group-divisible=1` 执行一个 epoch 的真实 HESSO 稀疏训练、物理构网、结构化 checkpoint 重载和后置门禁；停在 prune，不触发微调、导出或 ORT。
+4. 本轮必须同步六个文件：`only_train_once/graph/graph.py`、`only_train_once/subnet_construction/pruning_compression.py`、`prune_yolo11_adamcf.py`、`probe_yolo11_all_verified_safe.py`、`verify_yolo11_csp_dense_closure.py`、`test_segmented_concat_contract.py`。前两者是通用 Concat 段合同的最小修复：除显式 source 外，若同一 Concat 的其他输入段也有唯一、输出宽度一致的可剪 owner，必须把其零索引同步到消费者 input-axis；不含合同的旧模型不会走这条逻辑。
+
+第零步：通用 Concat 的显式 + 被动生产者回归（必须先通过）
+
+```bash
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+mkdir -p logs runs/segmented_concat_contract_unit_v3_passive_owner && \
+python -m py_compile \
+  /workspace/OTOv2_v2/only_train_once/graph/graph.py \
+  /workspace/OTOv2_v2/only_train_once/subnet_construction/pruning_compression.py \
+  test_segmented_concat_contract.py && \
+python -u test_segmented_concat_contract.py \
+  --output runs/segmented_concat_contract_unit_v3_passive_owner \
+  2>&1 | tee logs/20260723_segmented_concat_contract_unit_v3_passive_owner.log
+```
+
+通过标准：`branch_a` 是登记闭包的显式 owner，`branch_b` 是同一 Concat 的被动但唯一输出 owner；两者分别删除 `{1,3}`、`{0,4}` 后，消费者输入必须由 `9→5`，原始删除坐标必须是 `[1,3,4,8]`，并通过前向、反向、optimizer step 和保存重载。失败时不要运行 YOLO11 P30。
+
+第一步：只做 v4 依赖图审计（通过后才执行第二步）
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260723_yolo11n_all_verified_safe_num_head_v5_passive_concat_owner_p30_l3_audit && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  probe_yolo11_all_verified_safe.py \
+  verify_yolo11_csp_dense_closure.py && \
+python -c "from only_train_once.graph.graph import Graph; from only_train_once.subnet_construction.pruning_compression import apply_segmented_concat_consumer_contracts; from prune_yolo11_adamcf import ALL_VERIFIED_SAFE_NUM_HEAD_V4_OUTPUT_CLOSURE_PROFILE as P; assert callable(getattr(Graph, 'output_consumer_closure_records', None)); assert callable(getattr(Graph, 'discover_output_consumer_closures', None)); assert callable(getattr(Graph, 'register_segmented_concat_consumer_contracts', None)); assert callable(apply_segmented_concat_consumer_contracts); print({'profile': P, 'graph_api': 'pass', 'segmented_concat_executor': 'pass', 'passive_segment_owner_support': 'covered_by_unit_v3'})" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_num_head_v4_output_closure_experimental \
+  --prune-ratio 0.30 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after audit \
+  2>&1 | tee "logs/${RUN_ID}_audit.log"
+
+通过标准：`audit.json` 为 `audit_passed`；v4 output closure 显示 `resolved=8/8`、`quarantined=0`、`segmented_concat_contracts=3/3`；`output_consumer_composite_ownership.status=pass`；`segmented_concat_candidate_owner_coverage.status=pass` 且 `candidate_segment_count>0`；所有已验证模块族保护后仍有可剪非 auxiliary 组。若任一项不满足，只同步 audit.json 与日志，不启动 P30。
+
+第二步：P30 全量联合剪枝-only L3（不微调、不导出）
+
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260723_yolo11n_all_verified_safe_num_head_v5_passive_concat_owner_p30_l3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_num_head_v4_output_closure_experimental \
+  --prune-ratio 0.30 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_prune.log"
+
+P30 成功后同步：`runs/${RUN_ID}/nine_stage_admission.json`、`runs/${RUN_ID}_audit/audit.json`、`runs/${RUN_ID}_prune/{adamcf_runtime.json,structured_subnet.json,prune_summary.json,post_prune_gate.json}`、`runs/${RUN_ID}_prune/oto_graph/`、两份日志，以及结构化权重的文件名/大小/SHA256 清单。不要启动 `finetune`、`export` 或 ONNX Runtime。
+
+v5 已完成稀疏训练但被旧复合 linter 误拒后的恢复验证（2026-07-23）：先回归失败产物，再无训练重建
+
+说明：
+
+1. `20260723_yolo11n_all_verified_safe_num_head_v5_passive_concat_owner_p30_l3` 已经完成 1 epoch HESSO、物理构网、原始压缩模型重载和整网前向；`model.22`、`model.8` 的失败报告中，root/child/Concat 输入/BN 全部正确，只有旧的 `external_output_fixed` 假设为 false。
+2. 新 linter 不会简单取消外部输出校验：若该 C3k2 `cv2` 没有对应的 `output-consumer closure` 记录，仍强制输出宽度不变；有记录时必须同时满足 producer BN、全部已识别消费者输入、当前输出宽度和 wrapper 对应关系。第一条命令直接重放 v5 压缩物理子网，验证这一条件。
+3. 两条命令均不得重新执行 HESSO。第二条从 v5 的 `DetectionModel_full_group_sparse.pt` 恢复构网；它仍先用当前代码创建新 audit、核对合同 provenance，随后重新保存结构化 checkpoint、重载前向并执行 post-prune gate。若合同指纹不一致会 fail-closed。
+
+本次仅需同步：`prune_yolo11_adamcf.py`、`test_c3k2_composite_output_closure_linter.py` 与本文件。不要覆盖 v5 的任何产物；使用下列新 RUN_ID。
+
+第零步：v5 失败产物的 C3k2 + output-consumer closure linter 回归（必须通过）
+
+```bash
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+FAILED_RUN=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v5_passive_concat_owner_p30_l3_prune && \
+mkdir -p logs runs/c3k2_composite_output_closure_linter_v1 && \
+test -f "$FAILED_RUN/oto_artifacts/DetectionModel_compressed.pt" && \
+test -f "$FAILED_RUN/adamcf_runtime.json" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  test_c3k2_composite_output_closure_linter.py && \
+python -u test_c3k2_composite_output_closure_linter.py \
+  --compressed "$FAILED_RUN/oto_artifacts/DetectionModel_compressed.pt" \
+  --runtime "$FAILED_RUN/adamcf_runtime.json" \
+  --imgsz 640 \
+  --output runs/c3k2_composite_output_closure_linter_v1/report.json \
+  2>&1 | tee logs/20260723_c3k2_composite_output_closure_linter_v1.log
+```
+
+通过标准：输出 `[pass] C3k2 复合 + output-consumer closure linter 回归通过`；报告中的 `closure_summary.status`、`composite_summary.status` 都为 `pass`；`reduced_composite_modules` 至少包含实际收缩的 `model.8`、`model.22`，且这些记录的 `external_output_policy=output_consumer_closure`、`external_output_fixed=false`、`checks.external_output_contract_valid=true`。失败时只同步本报告与日志，停止。
+
+第一步：从 v5 full-sparse 恢复物理子网（不训练、不微调、不导出）
+
+```bash
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260723_yolo11n_all_verified_safe_num_head_v6_closure_linter_rebuild_p30_l3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+FULL_SPARSE=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v5_passive_concat_owner_p30_l3_prune/oto_artifacts/DetectionModel_full_group_sparse.pt && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && test -f "$FULL_SPARSE" && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --rebuild-from-full-sparse "$FULL_SPARSE" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_num_head_v4_output_closure_experimental \
+  --prune-ratio 0.30 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_rebuild.log"
+```
+
+通过标准：新 `audit.json` 仍为 `audit_passed`；`rebuild_structured_subnet.json` 的状态为 `structured_subnet_rebuilt_and_forward_verified`；其 `yolo11_output_consumer_closure_structure.status` 和 `yolo11_c3k2_composite_structure.status` 都为 `pass`；`post_prune_gate.json.status=pass`。这只是同一 P30 稀疏源的恢复构网验证，不能写成新的 HESSO 训练 run；不要运行 `finetune`、`export` 或 ONNX Runtime。
+
+v6 recovery provenance 假阳性修复（2026-07-23）：必须使用新的 v7 RUN_ID
+
+v6 的第一步 linter 回归已经通过；v6 的 recovery 在任何物理裁剪前被 provenance 门禁正确拦下。原因不是 source/rebuild 合同不同（两者 SHA256 相同），而是 recovery 把全局所有名称为 `*.cv1.conv.weight` 的候选误当作 C3k2 root，混入普通 Conv/C2PSA/C3k。修复改为只从已冻结的 `yolo11_c3k2_paired_chunk_contracts` 与 `yolo11_c3k2_dynamic_concat_contracts` 取参数、再和真实候选取交集；源 v5 的结果为 root `13` 组候选、dynamic child `3` 组候选，均与实际所有权签名严格一致。
+
+本次同步：`prune_yolo11_adamcf.py`、`test_c3k2_composite_recovery_ownership.py`、本文件。`only_train_once`、HESSO、Graph 和物理执行器均不变。不要重用 v6 RUN_ID，也不要重跑 linter test 或 HESSO。
+
+```bash
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+RUN_ID=20260723_yolo11n_all_verified_safe_num_head_v7_recovery_ownership_p30_l3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+SOURCE_RUN=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v5_passive_concat_owner_p30_l3_prune && \
+FULL_SPARSE="$SOURCE_RUN/oto_artifacts/DetectionModel_full_group_sparse.pt" && \
+mkdir -p logs runs/c3k2_composite_recovery_ownership_v1 && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+test -f "$SOURCE_RUN/adamcf_runtime.json" && test -f "$FULL_SPARSE" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  test_c3k2_composite_recovery_ownership.py \
+  verify_yolo11_csp_dense_closure.py && \
+python -u test_c3k2_composite_recovery_ownership.py \
+  --runtime "$SOURCE_RUN/adamcf_runtime.json" \
+  --output runs/c3k2_composite_recovery_ownership_v1/report.json \
+  2>&1 | tee logs/20260723_c3k2_composite_recovery_ownership_v1.log && \
+CUDA_VISIBLE_DEVICES=2 python -u verify_yolo11_csp_dense_closure.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --rebuild-from-full-sparse "$FULL_SPARSE" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_num_head_v4_output_closure_experimental \
+  --prune-ratio 0.30 \
+  --group-divisible 1 \
+  --lr0 0.001 \
+  --imgsz 640 \
+  --batch 64 \
+  --workers 12 \
+  --device 0 \
+  --oto-opset 16 \
+  --output runs \
+  --logs logs \
+  --start-stage audit \
+  --stop-after prune \
+  2>&1 | tee "logs/${RUN_ID}_audit_rebuild.log"
+```
+
+通过标准：先输出 `[pass] C3k2 composite recovery 所有权回归通过`，报告中 `root_count=13`、`dynamic_count=3`；然后新 audit 通过、`rebuild_structured_subnet.json.status=structured_subnet_rebuilt_and_forward_verified`、output closure 与 C3k2 composite 两个结构 summary 均为 `pass`，最后 `post_prune_gate.json.status=pass`。整个命令不运行 HESSO、微调、导出或 ONNX Runtime。
+
+## 当前全开放联合 P30 正式完整流程（2026-07-23）
+
+本流程以此前 P10/P30 全流程为蓝本，但固定使用当前已通过 L3 验证的
+`all_verified_safe_num_head_v4_output_closure_experimental` 联合 profile；它覆盖
+已适配的 C3k2/C3k/Bottleneck、SPPF、Detect 隐藏支路、C2PSA 输出闭包、
+C3k2 paired-chunk/dynamic-concat/output-consumer closure 和 Attention `num_head`。
+
+调度语义明确为：总稀疏训练 90 epoch，其中前 10 epoch 仅预热，后 80 epoch
+由 HESSO 执行 P30 剪枝；之后对同一物理子网连续微调 80 epoch，`--admission-probe`
+在微调首个 epoch 完成固定输入前向、真实 task-loss 反向和首次 optimizer step 的门禁，
+不另起一个会改变权重来源的 1 epoch 微调任务。`--close-mosaic 20` 延续早期 P10/P30
+蓝本。最终必须完成 best.pt 独立重载、ONNX checker 和 PyTorch/ONNX Runtime 固定输入对齐。
+
+正式入口：`verify_yolo11_all_verified_safe_p30_full.py`。它复用九段编排器，并固定
+profile、P30 和 90/10/80 调度；关键是剪枝阶段后会写入并强制通过
+`post_prune_gate.json`，确认 C3k2 composite、output-consumer closure、Attention 合同和
+实际候选依赖组命中都安全，才会进入微调。OTO/HESSO 核心实现没有复制或改写。
+Ultralytics batch 进度会实时在同一行覆盖刷新；阶段边界、`EpochReporter` 逐 epoch
+摘要、HESSO、AdaMCF α 和错误输出保持原样。日志同样保留原始回车进度帧。
+
+```bash
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+export CUDA_VISIBLE_DEVICES=2 && \
+RUN_ID=20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v3 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  verify_yolo11_all_verified_safe_p30_full.py && \
+python -c "import torch, onnx, onnxruntime; assert torch.cuda.is_available(); print({'torch': torch.__version__, 'onnx': onnx.__version__, 'onnxruntime': onnxruntime.__version__, 'ort_providers': onnxruntime.get_available_providers(), 'logical_gpu': 0, 'gpu_name': torch.cuda.get_device_name(0)})" && \
+python -u verify_yolo11_all_verified_safe_p30_full.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --module-coverage-profile all_verified_safe_num_head_v4_output_closure_experimental \
+  --prune-ratio 0.30 --group-divisible 1 \
+  --prune-epochs 90 --warmup-epochs 10 --pruning-periods 80 \
+  --finetune-epochs 80 --close-mosaic 20 \
+  --imgsz 640 --device 0 --oto-opset 16 \
+  --opset 12 --export-device cpu \
+  --lr0 0.001 --batch 64 --workers 12 \
+  --output runs --logs logs \
+  --alignment-atol 1e-4 --alignment-rtol 1e-3 \
+  --start-stage audit --stop-after report \
+  2>&1 | tee "logs/${RUN_ID}_all.log"
+```
+
+该命令不使用 `--no-overwrite`；新 RUN_ID 已与历史 L3、P10、P30 产物隔离。若显存不足，
+只将三处 `--batch 64` 同步改为 `--batch 32` 或 `--batch 16`，不要修改 profile、P30、
+90/10/80 调度或结构化权重名。
+
+### 已完成 P30 剪枝后的恢复：从实际 `*_prune5` 继续微调、导出与九段报告（2026-07-24）
+
+若完整流程的剪枝本身已成功、但 Ultralytics 因既有目录自动把实际目录命名为
+`*_prune5`，旧编排器仍读取静态 `*_prune` 而在 post-prune gate 失败，则**不要重跑
+90 epoch 稀疏训练**。新版编排器接受 `--prune-run-dir`，先对该实际目录重新执行门禁，
+再继续 80 epoch 微调、best.pt 独立重载、ONNX 导出与 ORT 对齐。
+
+本命令故意保持历史 `RUN_ID` 为 `v1`，以复用同一轮 audit 合同；但报告写入独立
+`resume_prune5` 目录，避免覆盖此前失败的 admission JSON。微调实际目录即使因已有
+目录自动追加数字后缀，也会被新版编排器在完成后自动解析，导出会跟随该真实目录。
+
+```bash
+cd /workspace/OTOv2_v2/test/pretrain_yolo11_coco && \
+set -o pipefail && \
+export PYTHONPATH=/workspace/OTOv2_v2${PYTHONPATH:+:$PYTHONPATH} && \
+export CUDA_VISIBLE_DEVICES=2 && \
+RUN_ID=20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1 && \
+WEIGHTS=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt && \
+DATA=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/coco2017_yolo11.yaml && \
+FIXED_INPUT=/workspace/data/coco2017/images/val2017/000000000139.jpg && \
+PRUNE_RUN=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/${RUN_ID}_prune5 && \
+REPORT_OUTPUT=/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/${RUN_ID}_resume_prune5/nine_stage_admission.json && \
+mkdir -p logs && \
+test -f "$WEIGHTS" && test -f "$DATA" && test -f "$FIXED_INPUT" && \
+test -f "$PRUNE_RUN/adamcf_run_metadata.json" && \
+test -f "$PRUNE_RUN/prune_summary.json" && \
+test -f "$PRUNE_RUN/weights/yolo11n_all_verified_safe_num_head_v4_output_closure_structured.pt" && \
+python -m py_compile \
+  prune_yolo11_adamcf.py \
+  verify_yolo11_csp_dense_closure.py \
+  verify_yolo11_all_verified_safe_p30_full.py && \
+python -c "import torch, onnx, onnxruntime; assert torch.cuda.is_available(); print({'torch': torch.__version__, 'onnx': onnx.__version__, 'onnxruntime': onnxruntime.__version__, 'ort_providers': onnxruntime.get_available_providers(), 'logical_gpu': 0, 'gpu_name': torch.cuda.get_device_name(0)})" && \
+python -u verify_yolo11_all_verified_safe_p30_full.py \
+  --weights "$WEIGHTS" \
+  --data "$DATA" \
+  --fixed-input "$FIXED_INPUT" \
+  --run-id "$RUN_ID" \
+  --prune-run-dir "$PRUNE_RUN" \
+  --report-output "$REPORT_OUTPUT" \
+  --module-coverage-profile all_verified_safe_num_head_v4_output_closure_experimental \
+  --prune-ratio 0.30 --group-divisible 1 \
+  --prune-epochs 90 --warmup-epochs 10 --pruning-periods 80 \
+  --finetune-epochs 80 --close-mosaic 20 \
+  --imgsz 640 --device 0 --oto-opset 16 \
+  --opset 12 --export-device cpu \
+  --lr0 0.001 --batch 64 --workers 12 \
+  --output runs --logs logs \
+  --alignment-atol 1e-4 --alignment-rtol 1e-3 \
+  --start-stage finetune --stop-after report \
+  2>&1 | tee "logs/${RUN_ID}_resume_prune5_all.log"
+```
+
+开始微调前应首先看到“剪枝后早停门禁：通过”，并且其详细报告位于
+`$PRUNE_RUN/post_prune_gate.json`；若此门禁没有通过，编排器不会启动微调。

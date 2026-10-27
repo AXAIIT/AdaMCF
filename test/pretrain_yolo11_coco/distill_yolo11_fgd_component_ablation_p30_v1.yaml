@@ -1,0 +1,85 @@
+# P30 物理学生的 FGD 四项损失累计消融。
+# 目的不是把所有策略混在一次训练里，而是在 P3/P4/P5 尺度和官方系数均固定时，
+# 定位前景、背景、注意力 mask、全局关系项分别带来的增量影响。
+config_status: "implementation_ready_pending_remote_contract_and_admission"
+experiment_family: "Y11-FGD-ComponentAblation-v1"
+implementation: "legacy_8_3_246_official_fgd_featureloss_area_mask_attention_gc_relation_v3_component_switches"
+seed: 42
+
+teacher:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt"
+  sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+  role: "unpruned_yolo11n_frozen"
+  frozen: true
+student:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1_finetune1/weights/best.pt"
+  sha256: "f35bc5eb8a2c67150c1f2203b1d7d6b9b8a32fcc4d451d1fb4e21f9a091e94ca"
+  role: "P30_S0_finetuned_physical_student"
+  structure_sha256: "72bc0bf5f5ce97bfae2b3326097246ba9152bd449049d672d767b6d40ace8ed0"
+  baseline_validation:
+    map50: 0.5294577071263171
+    map50_95: 0.3713838395714083
+
+fixed_feature_scope:
+  levels: "Detect 输入 P3/P4/P5；三条候选均固定，不做尺度消融"
+  official_featureloss: "GT 面积掩码、空间/通道注意力、conv_mask_s/t→global context→channel_add_s/t"
+  auxiliary_checkpoint_rule: "所有训练期对齐/FGD 辅助模块、教师、hook 与 criterion 必须在保存 best.pt 前剥离"
+
+common_training_contract:
+  epochs: 20
+  imgsz: 640
+  batch: 64
+  workers: 12
+  optimizer: "SGD"
+  lr0: 0.0005
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 0
+  close_mosaic: 20
+  amp: false
+  fgd_total_weight: 1.0
+  fgd_warmup_epochs: 5
+  temperature: 0.5
+  alpha_foreground: 0.001
+  beta_background: 0.0005
+  gamma_attention_mask: 0.0005
+  lambda_relation: 0.000005
+  disabled_branches: "PredictionKD=false; NeckSL2=false"
+
+# 同一新代码版本下需重新运行 F4；历史全量 FGD 仅作负向趋势参考，不能替代本轮严格同版本对照。
+shared_control:
+  id: "F0_noKD"
+  mode: "control"
+  run_once: true
+  rule: "与 F1--F4 使用同一 teacher/student/data/seed/optimizer/增强和脚本 SHA256；仅关闭 FGD"
+  comparison_contract: "脚本 SHA256、FGD 数值超参数、训练合同必须相同；子项开关是 control/KD 唯一允许不同的目标字段"
+
+component_runs:
+  - id: "F1_foreground"
+    enabled: {foreground: true, background: false, mask: false, relation: false}
+    loss: "L_det + warmup*lambda_fgd*(alpha*L_fg)*batch_size"
+  - id: "F2_foreground_background"
+    enabled: {foreground: true, background: true, mask: false, relation: false}
+    loss: "L_det + warmup*lambda_fgd*(alpha*L_fg + beta*L_bg)*batch_size"
+  - id: "F3_foreground_background_mask"
+    enabled: {foreground: true, background: true, mask: true, relation: false}
+    loss: "L_det + warmup*lambda_fgd*(alpha*L_fg + beta*L_bg + gamma*L_mask)*batch_size"
+  - id: "F4_full_official_FGD"
+    enabled: {foreground: true, background: true, mask: true, relation: true}
+    loss: "L_det + warmup*lambda_fgd*(alpha*L_fg + beta*L_bg + gamma*L_mask + lambda*L_relation)*batch_size"
+
+admission:
+  unit: "默认四项全开与显式四项全开逐元素等价；F1/F2/F3 分项损失、掩码和反向路径均通过"
+  each_candidate: "先 1 epoch；检查教师零梯度、物理学生梯度、已参与的 FGD 辅助路径、optimizer ownership、纯学生 checkpoint、结构/参数量与固定输入前向"
+  formal: "仅在四条 1 epoch 准入全部通过后，单卡串行执行 F0 + F1--F4 的 20 epoch strict pair"
+
+decision_rule:
+  primary_metric: "mAP@0.5:0.95"
+  20_epoch_role: "风险筛查和组成项排序；持续负向/质量非劣失败的组合冻结"
+  positive_short_result: "小幅正向候选保留从原始 student 重启完整周期 strict pair 的资格；+0.30pp 是完整周期可采纳目标而非短程硬淘汰线"
+  next_after_component_ablation: "仅对非劣或正向的最小组合，再做 P3/P4/P5 尺度消融或完整周期验证"
+
+historical_reference:
+  run_id: "20260731_yolo11n_p30_official_fgd_pair_e20_v2"
+  result: "full FGD minus control = -0.2086pp map50 / -0.3126pp map50_95"
+  use: "解释为何需要分项消融；不能替代本轮同代码 SHA256 的 F4"

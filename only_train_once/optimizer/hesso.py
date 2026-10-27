@@ -5,7 +5,7 @@ import random
 from torch.optim.optimizer import Optimizer, required
 import torch.nn.functional as F
 from collections import deque, defaultdict
-from only_train_once.transform import TensorTransform, index_transformation_param_group
+from only_train_once.transform import TensorTransform, index_transformation_param_group, pruning_axis
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
 from only_train_once.graph import Graph
 from only_train_once.transform import tensor_transformation
@@ -28,14 +28,60 @@ class HESSO(BaseHybridSparseOptimizer):
 
     @staticmethod
     def _build_period_quota(total_groups: int, periods: int, mode: str = "cosine_front"):
-        import numpy as np
-        if periods <= 1 or total_groups <= 0:
+        """Build integer period quotas from the paper's cumulative schedule.
+
+        Algorithm 2 first rounds the cumulative target ``N_p`` and then uses
+        ``n_p = N_p - N_{p-1}``.  Rounding each period independently and
+        repairing the remainder is not equivalent and systematically moves the
+        rounding residual toward the largest (early) cosine weights.
+        """
+        total_groups = int(total_groups)
+        periods = int(periods)
+        if periods <= 1:
             return [max(total_groups, 0)]
-        if mode == "uniform":
-            allot = [total_groups // periods] * periods
-            allot[-1] += total_groups - sum(allot)
-            return allot
-        if mode == "uniform_random":
+        if total_groups <= 0:
+            return [0] * periods
+        schedule_aliases = {
+            "uniform": "uniform",
+            "balanced_uniform": "uniform",
+            "cosine": "cosine_front",
+            "cosine_front": "cosine_front",
+            "uniform_random": "uniform_random",
+        }
+        normalized_mode = schedule_aliases.get(str(mode).strip().lower())
+        if normalized_mode is None:
+            raise ValueError(f"Unknown pruning quota mode: {mode}")
+
+        if normalized_mode in {"uniform", "cosine_front"}:
+            cumulative_targets = [0]
+            for step in range(1, periods + 1):
+                tau = step / periods
+                if normalized_mode == "uniform":
+                    phi = tau
+                else:
+                    # Paper Algorithm 2:
+                    # Phi(tau) = tau + sin(pi*tau) / pi.
+                    phi = tau + np.sin(np.pi * tau) / np.pi
+
+                # All values are non-negative.  Explicit half-up rounding
+                # avoids Python's banker's-rounding behavior at exact .5.
+                rounded_target = int(np.floor(total_groups * phi + 0.5))
+                rounded_target = min(total_groups, max(0, rounded_target))
+                cumulative_targets.append(rounded_target)
+
+            # Guard against floating-point drift at tau=1.
+            cumulative_targets[-1] = total_groups
+            alloc = [
+                cumulative_targets[index + 1] - cumulative_targets[index]
+                for index in range(periods)
+            ]
+            if any(quota < 0 for quota in alloc) or sum(alloc) != total_groups:
+                raise RuntimeError(
+                    "Algorithm-2 cumulative quota construction failed: "
+                    f"mode={normalized_mode}, total={total_groups}, periods={periods}"
+                )
+            return alloc
+        if normalized_mode == "uniform_random":
             base = [total_groups // periods] * periods
             remainder = total_groups % periods
             indices = list(range(periods))
@@ -43,30 +89,14 @@ class HESSO(BaseHybridSparseOptimizer):
             for i in range(remainder):
                 base[indices[i]] += 1
             return base
-        if mode == "cosine_front":
-            x = np.linspace(0, 1, periods, endpoint=True)
-            w = 1 - np.cos(np.pi * (1 - x))  # 前期权重更大
-            w = w / w.sum()
-            alloc = np.floor(w * total_groups).astype(int)
-            diff = total_groups - int(alloc.sum())
-            if diff > 0:
-                order = np.argsort(-w)
-                for i in range(diff):
-                    alloc[order[i % periods]] += 1
-            elif diff < 0:
-                order = np.argsort(w)
-                for i in range(-diff):
-                    idx = order[i % periods]
-                    if alloc[idx] > 0:
-                        alloc[idx] -= 1
-            return alloc.tolist()
-        raise ValueError(f"Unknown pruning quota mode: {mode}")
+        raise AssertionError(f"Unhandled pruning quota mode: {normalized_mode}")
 
 
     def __init__(self, params, variant='sgd', lr=required, first_momentum=None, second_momentum=None, \
                  dampening=None, weight_decay=None, target_group_sparsity=0.5, \
                  start_pruning_step=0, pruning_steps=None, pruning_periods=200, \
-                 group_divisible=1, importance_score_criteria='default', device='cuda', alpha_scheduler_cfg=None, seed=None):
+                 group_divisible=1, importance_score_criteria='default', device='cuda', alpha_scheduler_cfg=None, seed=None,
+                 pruning_schedule_mode='cosine_front'):
 
         '''
         first_momentum (一阶动量)：SGD, Adam, AdamW
@@ -83,6 +113,7 @@ class HESSO(BaseHybridSparseOptimizer):
         print(f"  {'Start Pruning Step:':<30} {start_pruning_step}")
         print(f"  {'Pruning Steps (total):':<30} {pruning_steps}")
         print(f"  {'Pruning Periods:':<30} {pruning_periods}")
+        print(f"  {'Pruning Schedule:':<30} {pruning_schedule_mode}")
         print(f"  {'Group Divisible:':<30} {group_divisible}")
         print(f"  {'Importance Score Criteria:':<30} {importance_score_criteria}")
 
@@ -98,6 +129,21 @@ class HESSO(BaseHybridSparseOptimizer):
         if self.seed is not None:
             self._seed_everything(self.seed)
         self.pruned_group_idxes = list()
+
+        schedule_aliases = {
+            'cosine': 'cosine_front',
+            'cosine_front': 'cosine_front',
+            'uniform': 'uniform',
+            'balanced_uniform': 'uniform',
+            'uniform_random': 'uniform_random',
+        }
+        requested_schedule = str(pruning_schedule_mode).strip().lower()
+        if requested_schedule not in schedule_aliases:
+            raise ValueError(
+                "pruning_schedule_mode must be one of: cosine_front, "
+                "uniform, balanced_uniform, uniform_random"
+            )
+        self.pruning_schedule_mode = schedule_aliases[requested_schedule]
 
         if importance_score_criteria == 'default':
             self.importance_score_criteria = {
@@ -124,9 +170,13 @@ class HESSO(BaseHybridSparseOptimizer):
         self.active_num_redundant_groups = self._build_period_quota(
             total_groups=self.target_num_redundant_groups,
             periods=self.pruning_periods,
-            mode="cosine_front"
+            mode=self.pruning_schedule_mode,
         )
-        print(f"Target redundant groups per period: ", self.active_num_redundant_groups)
+        print(
+            f"Target redundant groups per period "
+            f"({self.pruning_schedule_mode}): ",
+            self.active_num_redundant_groups,
+        )
 
         # === α 调度器（超参在 alpha_scheduler.py 内部集中管理） ===
         self._alpha_keys = list(self.importance_score_criteria.keys())
@@ -309,7 +359,7 @@ class HESSO(BaseHybridSparseOptimizer):
                     p.data.add_(group['grad_variant'][p_name], alpha=-group['lr'])
 
                     active_redundant_idxes = index_transformation_param_group(group['active_redundant_idxes'], p_transform, group)
-                    if p_transform == TensorTransform.TRANSPOSE and len(p.data.shape) > 1:
+                    if pruning_axis(p_transform) == 1 and len(p.data.shape) > 1:
                         p.data[:, active_redundant_idxes, ...] *= (self.pruning_period_duration - t - 1.0) / (self.pruning_period_duration - t)
                     else:
                         p.data[active_redundant_idxes] *= (self.pruning_period_duration - t - 1.0) / (self.pruning_period_duration - t)
@@ -564,7 +614,7 @@ class HESSO(BaseHybridSparseOptimizer):
             if len(idx) == 0:
                 continue
             idx_t = torch.as_tensor(idx, dtype=torch.long, device=p.data.device)
-            if p_transform == TensorTransform.TRANSPOSE and len(p.data.shape) > 1:
+            if pruning_axis(p_transform) == 1 and len(p.data.shape) > 1:
                 orig = p.data[:, idx_t, ...].clone()
                 p.data[:, idx_t, ...] *= ratio
                 backups.append(("param_col", p, idx_t, orig))
@@ -599,4 +649,3 @@ class HESSO(BaseHybridSparseOptimizer):
                 tensor.data[:, idx_t, ...] = orig
             else:
                 tensor.data[idx_t] = orig
-

@@ -1,0 +1,75 @@
+required_fields:
+  - config_status
+  - experiment_id
+  - teacher_student_config
+  - seed
+  - teacher
+  - student
+  - comparison_baseline
+  - epochs
+  - batch_size
+  - optimizer
+  - distillation
+  - outputs
+
+fields:
+  config_status: placeholder_not_verified | verified
+  placeholder_rule: when config_status is placeholder_not_verified, string_or_null fields may be null; when config_status is verified, verified_rules below override placeholders.
+  experiment_id: string
+  teacher_student_config: string
+  seed: integer
+  teacher:
+    required: [source, role]
+    fields:
+      source: string
+      role: unpruned_yolo11n_frozen
+  student:
+    required: [source_pattern, role, prune_ratio_matrix, minimum_required_ratio]
+    fields:
+      source_pattern: string
+      role: finetuned_pruned_yolo11n
+      prune_ratio_matrix: list
+      minimum_required_ratio: number
+  comparison_baseline: same_ratio_finetuned_pruned_model
+  epochs: integer
+  batch_size: integer
+  optimizer:
+    required: [name, learning_rate]
+    fields:
+      name: string_or_null
+      learning_rate: number
+  distillation:
+    required: [type, temperature, loss_weights]
+    fields:
+      type: logits | feature | logits_feature | label_smoothing
+      temperature: number
+      loss_weights:
+        required: [task, logits, feature]
+        fields:
+          task: number
+          logits: number
+          feature: number
+  outputs:
+    required: [checkpoint_dir, raw_train_dir, raw_eval_dir]
+    fields:
+      checkpoint_dir: string
+      raw_train_dir: string
+      raw_eval_dir: string
+
+verified_rules:
+  when:
+    config_status: verified
+  then:
+    - epochs must be greater than 0.
+    - batch_size must be greater than 0.
+    - optimizer.name must be non-empty.
+    - optimizer.learning_rate must be greater than 0.
+    - distillation.temperature must be greater than 0.
+    - distillation.loss_weights must contain non-null task, logits, and feature values.
+    - teacher_student_config must be non-empty.
+    - teacher.role must be unpruned_yolo11n_frozen.
+    - student.role must be finetuned_pruned_yolo11n.
+    - student.prune_ratio_matrix must equal [0.10, 0.30] for the current scope; 0.50 is a deferred optional challenge and must not be required for acceptance.
+    - student.minimum_required_ratio must be one of the values in student.prune_ratio_matrix.
+    - comparison_baseline must be same_ratio_finetuned_pruned_model.
+    - outputs.checkpoint_dir, outputs.raw_train_dir, and outputs.raw_eval_dir must be non-empty.

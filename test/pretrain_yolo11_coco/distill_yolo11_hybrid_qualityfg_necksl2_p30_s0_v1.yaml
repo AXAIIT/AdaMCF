@@ -1,0 +1,59 @@
+# H1：QualityFG-PredDFL + Neck-SL2 的显式双分支探索。
+# 它是用户要求的未消融混合实验，不得反向写为已证明的推荐策略。
+config_status: "implementation_ready_pending_1epoch_admission_then_user_requested_100epoch_exploration"
+experiment_family: "Y11-Hybrid-QualityFG-PredDFL-NeckSL2-KD-v1"
+implementation: "legacy_8_3_246_multibranch_qualityfg_preddfl_necksl2_v1"
+seed: 42
+
+teacher:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt"
+  sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+  role: "unpruned_yolo11n_frozen"
+  frozen: true
+student:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1_finetune1/weights/best.pt"
+  sha256: "f35bc5eb8a2c67150c1f2203b1d7d6b9b8a32fcc4d451d1fb4e21f9a091e94ca"
+  role: "P30_S0_finetuned_physical_student"
+  structure_sha256: "72bc0bf5f5ce97bfae2b3326097246ba9152bd449049d672d767b6d40ace8ed0"
+  baseline_validation:
+    map50: 0.5294577071263171
+    map50_95: 0.3713838395714083
+
+branches:
+  prediction_kd:
+    enabled: true
+    selection_mode: "quality_fg_v2"
+    contract: "gt_inside_teacher_cls_times_decoded_dfl_iou_per_gt_cross_scale_topk_v2"
+    quality_topk_per_gt: 15
+    cls_weight: 0.5
+    dfl_weight: 0.25
+    cls_temperature: 2.0
+    dfl_temperature: 2.0
+    warmup_epochs: 5
+  neck_sl2:
+    enabled: true
+    feature_weight: 3.0
+    warmup_epochs: 5
+    projector: "Conv1x1(C_student,C_teacher) -> ReLU -> Conv1x1(C_teacher,C_teacher)"
+    lifecycle: "training_only; optimizer_registered_once; removed_from_best_checkpoint"
+
+training_contract:
+  imgsz: 640
+  batch: 64
+  workers: 12
+  optimizer: "SGD"
+  lr0: 0.0005
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 0
+  close_mosaic: 20
+  amp: false
+
+admission:
+  run_epochs: 1
+  requirement: "teacher_frozen + prediction_KD_gradient + physical_student_gradient + Neck_projector_gradient + pure_student_checkpoint + fixed_forward"
+exploration:
+  run_epochs: 100
+  rationale: "用户要求的组合探索；不是 QualityFG 单分支效果门槛的升级。"
+  interpretation: "若无同合同 no-KD control，仅可报告绝对恢复结果和工程可用性，不得宣称组合 KD 因果收益。"
+checkpoint_contract: "physical_student_only_v1"

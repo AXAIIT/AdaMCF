@@ -10,7 +10,8 @@ class OTO:
     核心作用是将神经网络模型构建成一个图（Graph），进行剪枝分析，并支持多种优化器进行稀疏化处理，
     最终生成可部署的子网络模型。
     """
-    def __init__(self, model=None, dummy_input=None, compress_mode='prune', skip_patterns=None, strict_out_nodes=False):
+    def __init__(self, model=None, dummy_input=None, compress_mode='prune', skip_patterns=None, strict_out_nodes=False,
+                 onnx_opset_version=None):
         """
         初始化 OTO 实例。
         参数：
@@ -19,18 +20,21 @@ class OTO:
             compress_mode: 压缩模式，默认为 'prune'（剪枝），也可为 'erase'（未来支持）。
             skip_patterns: 需跳过处理的节点/层模式。
             strict_out_nodes: 是否严格对待输出节点。
+            onnx_opset_version: OTO 图追踪使用的 ONNX opset；None 时不覆盖 PyTorch 默认值。
         """
         self._graph = None                              # 存储构建好的图结构
         self._model = model                             # 原始模型
         self._dummy_input = dummy_input                 # 输入样本
         self._skip_patterns = skip_patterns             # 跳过模式
         self._strict_out_nodes = strict_out_nodes       # 输出节点是否严格处理，是否严格只将无出边节点作为输出节点
+        self._onnx_opset_version = onnx_opset_version   # OTO 图追踪使用的 ONNX opset
         self._mode = compress_mode                      # 压缩模式
         # 如果提供了模型和输入，则初始化图结构
         if self._model is not None and self._dummy_input is not None:
             # 初始化模型的计算图（Graph），为后续的剪枝、优化和稀疏化操作提供基础。
             print("正在创建计算图...")
-            self.initialize(model=self._model, dummy_input=self._dummy_input, skip_patterns=self._skip_patterns, strict_out_nodes=self._strict_out_nodes)
+            self.initialize(model=self._model, dummy_input=self._dummy_input, skip_patterns=self._skip_patterns,
+                            strict_out_nodes=self._strict_out_nodes, onnx_opset_version=self._onnx_opset_version)
             print("计算图创建完成！")
             if self._mode == 'prune':
                 # 执行剪枝相关流程
@@ -52,7 +56,7 @@ class OTO:
         """
         self._graph.cluster_node_groups(num_clusters=num_clusters)
 
-    def initialize(self, model=None, dummy_input=None, skip_patterns=None, strict_out_nodes=False):
+    def initialize(self, model=None, dummy_input=None, skip_patterns=None, strict_out_nodes=False, onnx_opset_version=None):
         """
         初始化图结构。
         参数：
@@ -60,13 +64,20 @@ class OTO:
             dummy_input: 模型输入样例。
             skip_patterns: 要跳过的节点/层模式。
             strict_out_nodes: 是否严格处理输出节点。
+            onnx_opset_version: OTO 图追踪使用的 ONNX opset；None 时不覆盖 PyTorch 默认值。
         """
         # 将模型切换到评估模式（eval），确保在构建计算图时不会受到训练模式（如 Dropout 或 BatchNorm）的影响。
         model = model.eval()
         self._model = model 
         self._dummy_input = dummy_input
         # 构建模型的计算图
-        self._graph = Graph(model, dummy_input, skip_patterns=skip_patterns, strict_out_nodes=strict_out_nodes)
+        self._graph = Graph(
+            model,
+            dummy_input,
+            skip_patterns=skip_patterns,
+            strict_out_nodes=strict_out_nodes,
+            onnx_opset_version=onnx_opset_version,
+        )
 
     def partition_pzigs(self):
         """
@@ -107,7 +118,8 @@ class OTO:
     def hesso(self, lr=0.1, weight_decay=None, first_momentum=None, second_momentum=None, \
                variant='sgd', target_group_sparsity=0.5, start_pruning_step=0, \
                pruning_steps=1, pruning_periods=1, device='cuda',\
-               dampening=None, group_divisible=1, fixed_zero_groups=True, importance_score_criteria='default', alpha_scheduler_cfg=None, seed=None):
+               dampening=None, group_divisible=1, fixed_zero_groups=True, importance_score_criteria='default', alpha_scheduler_cfg=None, seed=None,
+               pruning_schedule_mode='cosine_front'):
         """
         初始化并返回 HESSO (Hessian-based Structured Sparsity Optimization) 优化器实例。
         HESSO 是一种用于结构化剪枝的优化器，它利用二阶信息（Hessian）来评估参数组的重要性，
@@ -127,6 +139,9 @@ class OTO:
             group_divisible (int): 确保剪枝后的参数组数量是此值的倍数。默认为 1。
             fixed_zero_groups (bool): 是否在剪枝后固定那些已经被置零的参数组，使其不再更新。默认为 True。
             importance_score_criteria (str): 参数组重要性评分标准。'default' 可能表示使用 HESSO 默认的基于 Hessian 的方法。默认为 'default'。
+            pruning_schedule_mode (str): 每个 pruning period 的生产预算日程。
+                支持 'cosine_front'、'uniform'/'balanced_uniform' 和
+                'uniform_random'；默认保持原有的 cosine_front。
         返回：
             HESSO: 初始化后的 HESSO 优化器实例。
         """
@@ -151,6 +166,7 @@ class OTO:
             device=device,                                          # 计算设备
             alpha_scheduler_cfg=alpha_scheduler_cfg,                # Alpha 调度器配置
             seed=seed,                                              # 随机种子       
+            pruning_schedule_mode=pruning_schedule_mode,            # 每周期剪枝预算日程
         )
 
         return self._optimizer                                      # 返回创建的优化器实例

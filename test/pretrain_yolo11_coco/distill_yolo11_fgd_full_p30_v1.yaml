@@ -1,0 +1,68 @@
+# P30 物理学生的官方 FGD FeatureLoss 独立路线（历史首版快照）。
+# 它不是 Neck-SL2 的别名，也不与 Prediction KD / CrossHead 混合。
+config_status: "historical_full_fgd_completed_current_combination_frozen"
+experiment_family: "Y11-FGD-Full-KD-v1"
+implementation: "legacy_8_3_246_official_fgd_featureloss_area_mask_attention_gc_relation_v2"
+seed: 42
+
+teacher:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt"
+  sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+  role: "unpruned_yolo11n_frozen"
+  frozen: true
+student:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1_finetune1/weights/best.pt"
+  sha256: "f35bc5eb8a2c67150c1f2203b1d7d6b9b8a32fcc4d451d1fb4e21f9a091e94ca"
+  role: "P30_S0_finetuned_physical_student"
+  structure_sha256: "72bc0bf5f5ce97bfae2b3326097246ba9152bd449049d672d767b6d40ace8ed0"
+  baseline_validation:
+    map50: 0.5294577071263171
+    map50_95: 0.3713838395714083
+
+# 每个尺度使用官方 FeatureLoss：可选 student→teacher 1×1 对齐、注意力分支和 GC 关系分支。
+# 所有 FGD 辅助模块都在保存 best.pt 前剥离。
+feature_contract:
+  levels: "Detect.f 的运行时 P3/P4/P5；禁止硬编码层号"
+  auxiliary: "per-level optional Conv1x1 + conv_mask_s/t + GC context/channel_add_s/t"
+  checkpoint: "physical_student_only_v1"
+
+full_fgd:
+  contract: "official_fgd_featureloss_gt_area_mask_attention_mask_gc_relation_v1"
+  foreground_mask: "GT 映射到 feature grid 的 floor/ceil 闭区间；每框按离散面积倒数赋值，重叠取 max"
+  background_mask: "foreground=0 的位置，并按每图背景格数归一化"
+  attention: "teacher/student abs-mean -> temperature softmax；同时用于 feature weighting 与 L_mask"
+  global_relation: "official conv_mask_s/t spatial pool + channel_add_s/t global-context relation"
+  temperature: 0.5
+  alpha_foreground_weight: 0.001
+  beta_background_weight: 0.0005
+  gamma_attention_mask_weight: 0.0005
+  lambda_relation_weight: 0.000005
+  total_weight: 1.0
+  warmup_epochs: 5
+  scope: "independent_feature_KD_only; PredictionKD_NeckSL2_CrossHead all disabled"
+
+training_contract:
+  imgsz: 640
+  batch: 64
+  workers: 12
+  optimizer: "SGD"
+  lr0: 0.0005
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 0
+  close_mosaic: 20
+  amp: false
+
+admission:
+  run_epochs: 1
+  required: "official FGD unit test + frozen_teacher + physical_student_and_FGD_auxiliary_gradient + unique_optimizer_ownership + pure_student_checkpoint + fixed_forward"
+short_paired_screen:
+  run_epochs: 20
+  control: "same source/data/seed/optimizer/lr/epochs/batch/augmentation/FGD hyperparameters; FGD branch disabled only"
+  historical_result: "control=37.2235%, full_FGD=36.9109%, KD_minus_control=-0.3126pp mAP@0.5:0.95"
+  decision: "warmup 后持续负向且未通过质量非劣；禁止按本全量组合原样拉长到 80 epoch"
+formal_validation:
+  run_epochs: 80
+  prerequisite: "不适用于本历史全量组合；如有新的、经分项消融支持的配置，需从原始 student 重新建立 strict pair"
+
+comparison_tool: "scripts/compare_yolo11_distillation_runs.py"

@@ -25,6 +25,209 @@ LoRA 处理 (可选):
 import torch
 import os
 
+
+def apply_segmented_concat_consumer_contracts(oto_graph):
+    """按 Graph 登记的 Concat 段账本一次性裁剪消费者输入轴。
+
+    逻辑组仍完全属于各生产者 node group；本函数不创建优化器参数组，也不参与
+    HESSO 评分。它只在生产者的冗余索引已确定、消费者 input-axis 尚未裁剪时，
+    把 ``original_offset + local_redundant_index`` 合并成唯一的原始坐标集合。
+    """
+
+    contracts = list(
+        getattr(oto_graph, "segmented_concat_consumer_contracts", []) or []
+    )
+    if not contracts:
+        oto_graph.segmented_concat_contract_runtime = []
+        return set()
+
+    contracts_by_consumer = {}
+    for contract in contracts:
+        if not isinstance(contract, dict):
+            raise RuntimeError("segmented concat contract 必须是字典记录。")
+        consumer_node_id = str(contract.get("consumer_node_id", ""))
+        if not consumer_node_id:
+            raise RuntimeError(f"segmented concat contract 缺少 consumer_node_id：{contract}")
+        if contract.get("status") != "configured":
+            active_group_ids = {
+                str(segment.get("producer_owner_node_group_id"))
+                for segment in contract.get("segments", [])
+                if isinstance(segment, dict)
+                and segment.get("is_active_owner")
+                and segment.get("producer_owner_node_group_id")
+            }
+            if any(
+                bool(getattr(oto_graph.node_groups.get(group_id), "is_prunable", False))
+                for group_id in active_group_ids
+            ):
+                raise RuntimeError(
+                    "存在未解析且仍可剪的 segmented concat 合同，拒绝猜测物理 offset："
+                    f"{contract}"
+                )
+            continue
+        if consumer_node_id in contracts_by_consumer:
+            raise RuntimeError(
+                "同一消费者出现多个独立 segmented concat 合同；"
+                "必须先在 Graph 层合并并证明唯一 input-axis 所有权："
+                f"consumer_node_id={consumer_node_id}"
+            )
+        contracts_by_consumer[consumer_node_id] = contract
+
+    pruned_modules = set()
+    runtime_records = []
+    for consumer_node_id, contract in sorted(contracts_by_consumer.items()):
+        consumer_node = oto_graph.nodes.get(consumer_node_id)
+        consumer_op = getattr(consumer_node, "op", None)
+        consumer_module = getattr(consumer_op, "module", None)
+        if not isinstance(consumer_module, torch.nn.Conv2d):
+            raise RuntimeError(
+                "segmented concat 合同消费者必须是 Conv2d："
+                f"node={consumer_node_id}, contract={contract}"
+            )
+        if int(consumer_module.groups) != 1:
+            raise RuntimeError(
+                "segmented concat 合同当前仅支持普通 Conv(groups=1) 输入轴："
+                f"node={consumer_node_id}, groups={consumer_module.groups}"
+            )
+
+        segments = [
+            dict(segment)
+            for segment in contract.get("segments", [])
+            if isinstance(segment, dict)
+        ]
+        if not segments:
+            raise RuntimeError(f"segmented concat 合同没有 segment：{contract}")
+        expected_original_width = sum(
+            int(segment.get("original_width", 0) or 0) for segment in segments
+        )
+        declared_original_width = int(
+            contract.get("consumer_original_in_channels", 0) or 0
+        )
+        if (
+            expected_original_width <= 0
+            or declared_original_width != expected_original_width
+            or int(consumer_module.in_channels) != expected_original_width
+        ):
+            raise RuntimeError(
+                "segmented concat 原始段账本与消费者输入宽度不一致："
+                f"node={consumer_node_id}, ledger={expected_original_width}, "
+                f"declared={declared_original_width}, actual={consumer_module.in_channels}"
+            )
+
+        pruned_input_indices = []
+        segment_runtime = []
+        for segment in segments:
+            original_offset = int(segment.get("original_offset", -1))
+            original_width = int(segment.get("original_width", 0) or 0)
+            if original_offset < 0 or original_width <= 0:
+                raise RuntimeError(f"segmented concat segment offset/width 非法：{segment}")
+            redundant_indices = []
+            owner_id = segment.get("producer_owner_node_group_id")
+            # 显式 source 用于登记该 Concat 合同；但同一 Concat 的其他段若也
+            # 具有唯一、输出宽度一致的 node-group owner，可能在全量 profile 中
+            # 被 HESSO 独立裁剪。两类 owner 都必须把零索引同步到同一个消费者
+            # input-axis，随后在原始坐标合并、去重并只执行一次物理裁剪。
+            is_physical_owner = bool(
+                segment.get("is_active_owner")
+                or segment.get("is_passive_output_owner")
+            )
+            if is_physical_owner:
+                owner_group = oto_graph.node_groups.get(str(owner_id))
+                if owner_group is None:
+                    raise RuntimeError(
+                        "segmented concat 生产者输出 owner 不存在："
+                        f"owner={owner_id}, segment={segment}"
+                    )
+                if not owner_group.is_prunable:
+                    # profile 已在 audit 阶段 fail-closed 的 owner 不应再把零索引
+                    # 传播给消费者；这不是容错开放，而是保持保护语义。
+                    redundant_indices = []
+                else:
+                    redundant_indices = sorted(
+                        {
+                            int(index)
+                            for index in getattr(
+                                owner_group, "pruning_redundant_idxes", []
+                            )
+                        }
+                    )
+                    invalid_indices = [
+                        index
+                        for index in redundant_indices
+                        if index < 0 or index >= original_width
+                    ]
+                    if invalid_indices:
+                        raise RuntimeError(
+                            "segmented concat 生产者逻辑索引超出其原始输入段："
+                            f"owner={owner_id}, width={original_width}, invalid={invalid_indices}"
+                        )
+                    pruned_input_indices.extend(
+                        original_offset + index for index in redundant_indices
+                    )
+            segment_runtime.append(
+                {
+                    "input_index": int(segment.get("input_index", -1)),
+                    "producer_parameter_name": segment.get("producer_parameter_name"),
+                    "owner_node_group_id": owner_id,
+                    "is_active_owner": bool(segment.get("is_active_owner")),
+                    "is_passive_output_owner": bool(
+                        segment.get("is_passive_output_owner")
+                    ),
+                    "original_offset": original_offset,
+                    "original_width": original_width,
+                    "local_redundant_indices": redundant_indices,
+                }
+            )
+
+        pruned_input_indices = sorted(set(pruned_input_indices))
+        expected_current_width = expected_original_width - len(pruned_input_indices)
+        if expected_current_width <= 0:
+            raise RuntimeError(
+                "segmented concat 禁止把消费者输入轴裁成零："
+                f"node={consumer_node_id}, original={expected_original_width}, "
+                f"pruned={pruned_input_indices}"
+            )
+        if consumer_node.pruned_status.get("in_dim", False):
+            raise RuntimeError(
+                "segmented concat 消费者输入已被其他路径裁剪，所有权冲突："
+                f"node={consumer_node_id}, contract={contract['contract_id']}"
+            )
+
+        consumer_op.prune_in_dim(
+            pruned_idxes=pruned_input_indices,
+            param_names=consumer_node.param_names,
+        )
+        consumer_node.pruned_status["in_dim"] = True
+        if int(consumer_module.in_channels) != expected_current_width:
+            raise RuntimeError(
+                "segmented concat 消费者物理输入宽度与合同不一致："
+                f"node={consumer_node_id}, expected={expected_current_width}, "
+                f"actual={consumer_module.in_channels}"
+            )
+        if int(consumer_module.weight.shape[1]) != expected_current_width:
+            raise RuntimeError(
+                "segmented concat 消费者权重 axis=1 与合同不一致："
+                f"node={consumer_node_id}, expected={expected_current_width}, "
+                f"actual={consumer_module.weight.shape[1]}"
+            )
+        pruned_modules.add(consumer_module)
+        runtime_records.append(
+            {
+                "contract_id": contract["contract_id"],
+                "consumer_node_id": consumer_node_id,
+                "consumer_parameter_name": contract.get("consumer_parameter_name"),
+                "original_in_channels": expected_original_width,
+                "current_in_channels": int(consumer_module.in_channels),
+                "pruned_input_indices_original_coordinate": pruned_input_indices,
+                "segments": segment_runtime,
+                "status": "pass",
+            }
+        )
+
+    oto_graph.segmented_concat_contract_runtime = runtime_records
+    return pruned_modules
+
+
 def automated_pruning_compression(oto_graph, model, merge_lora_to_base, unmerge_lora_to_base, export_huggingface_format, export_float16, \
                           full_group_sparse_model_dir, compressed_model_dir, save_full_group_sparse_model, ckpt_format):
     """
@@ -106,6 +309,11 @@ def automated_pruning_compression(oto_graph, model, merge_lora_to_base, unmerge_
         # 将当前节点组包含的模块添加到已剪枝集合中
         pruned_out_dim_modules = pruned_out_dim_modules.union(node_group.get_modules())
 
+    # channel Concat 的消费者输入轴不能由“任选一个上游节点组”的旧回溯规则
+    # 推断。已登记的通用合同在原始坐标中合并所有活跃 segment 后一次性裁剪，并
+    # 标记消费者，避免第二遍输入剪枝重复删除同一列。
+    contract_pruned_in_modules = apply_segmented_concat_consumer_contracts(oto_graph)
+
     # 第二遍剪枝：执行输入维度剪枝
     def find_incoming_node_group_stem_node(graph, node, src_ng, visited, incoming_node_groups, incoming_stem_node_ids):
         """
@@ -136,7 +344,7 @@ def automated_pruning_compression(oto_graph, model, merge_lora_to_base, unmerge_
                 # 递归调用，继续向上查找
                 find_incoming_node_group_stem_node(graph, node_in, src_ng, visited, incoming_node_groups, incoming_stem_node_ids)
     
-    pruned_in_dim_modules = set()   # 用于记录已经执行过输入维度剪枝的模块，避免重复操作
+    pruned_in_dim_modules = set(contract_pruned_in_modules)   # 用于记录已经执行过输入维度剪枝的模块，避免重复操作
 
     # 遍历 OTO 图中的所有节点组
     for node_group in oto_graph.node_groups.values():
@@ -188,6 +396,14 @@ def automated_pruning_compression(oto_graph, model, merge_lora_to_base, unmerge_
 
             # 如果最终没有确定输入剪枝的索引 (in_dim_pruned_idxes is None)，则跳过当前节点
             if in_dim_pruned_idxes is None:
+                continue
+
+            # 某些复合算子只压缩内部瓶颈、外部输出轴保持固定。此时其逻辑
+            # 冗余索引不能继续传播给模块外部消费者；内部输入已由算子合同处理。
+            if (
+                hasattr(incoming_ng, 'op')
+                and getattr(incoming_ng.op, 'preserves_external_output_dim', False)
+            ):
                 continue
 
             # 特殊处理：针对多头注意力 (Multi-Head Attention) 等结构，检查输入节点组的操作 (op) 是否与多头注意力相关

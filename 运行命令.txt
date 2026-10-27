@@ -1,0 +1,155 @@
+python 02.preliminary_bert_squad.py   --train_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/train-v1.1.flat.json   --validation_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json   --test_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json   --model_name_or_path /workspace/only_train_once_personal_footprint-main/tutorials/bert-base-uncased
+python 01.resnet18_cifar10.py
+python 03.carnx2_super_resolution.py
+python sanity_check.py
+
+
+将输出重定向到01.resnet18_cifar10_output.txt, 保存为一个.txt文件:
+python 01.resnet18_cifar10.py > 01.resnet18_cifar10_output.txt
+python 02.preliminary_bert_squad.py --train_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/train-v1.1.flat.json --validation_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json --test_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json --model_name_or_path /workspace/only_train_once_personal_footprint-main/tutorials/bert-base-uncased > output_bert.txt 2>&1
+
+
+使用 tee 命令来实现这个需求。tee 命令会从标准输入读取数据，并将其同时输出到标准输出（即终端）和一个或多个文件：
+python 01.resnet18_cifar10.py | tee 01.resnet18_cifar10_output.txt
+
+把标准错误也重定向到文件和终端:
+python 01.resnet18_cifar10.py 2>&1 | tee 01.resnet18_cifar10_output.txt
+python 02.preliminary_bert_squad.py --train_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/train-v1.1.flat.json --validation_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json --test_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json --model_name_or_path /workspace/only_train_once_personal_footprint-main/tutorials/bert-base-uncased --group_sparsity 0.7 2>&1 | tee output_bert_sparsity_0.7.txt
+python 03.carnx2_super_resolution.py 2>&1 | tee 03.carnx2_super_resolution_output.txt
+
+python test/test_yolov5.py 2>&1 | tee test/test_yolov5_output.txt
+
+python test_llamav1.py 2>&1 | tee test_llamav1_output.txt
+
+sanity_check.py 文件下:
+python sanity_check.py 2>&1 | tee sanity_check_output0527.txt
+
+
+test文件下:
+python test/00.new_resnet18_cifar10.py  2>&1 | tee test/00.new_resnet18_cifar10.txt
+
+python 01.new_preliminary_bert_squad.py \
+    --train_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/train-v1.1.flat.json \
+    --validation_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json \
+    --test_file /workspace/only_train_once_personal_footprint-main/tutorials/SQuAD/dev-v1.1.flat.json \
+    --model_name_or_path /workspace/only_train_once_personal_footprint-main/tutorials/bert-base-uncased \
+    --group_sparsity 0.7 \
+    --do_pruning \
+    --output_dir ./output \
+    2>&1 | tee 01.new_preliminary_bert_squad_output_sparsity_0.7.txt
+
+python 03.new_carnx2_super_resolution.py 2>&1 | tee 03.new_carnx2_super_resolution_output_sparsity_0.7.txt
+
+python test/pretrain_resnet18_cifar10/00.pretrain_resnet18_cifar10_pruning.py 2>&1 | tee test/pretrain_resnet18_cifar10/00.pretrain_resnet18_cifar10_pruning_output.txt
+
+python test/pretrain_resnet18_cifar10/00.pretrain_resnet18_cifar10_grads_pruning.py 2>&1 | tee test/pretrain_resnet18_cifar10/00.pretrain_resnet18_cifar10_grads_pruning_output.txt
+
+python test/pretrain_vgg16_cifar10/00.pretrain_vgg16_cifar10_pruning.py 2>&1 | tee test/pretrain_vgg16_cifar10/00.pretrain_vgg16_cifar10_pruning_output.txt
+
+python test/pretrain_vgg16_cifar10/00.pretrain_vgg16_cifar10_grads_pruning.py 2>&1 | tee test/pretrain_vgg16_cifar10/00.pretrain_vgg16_cifar10_pruning_output.txt
+
+python test/pretrain_vgg16_bn_cifar10/00.pretrain_vgg16_bn_cifar10_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_vgg16_bn_cifar10/00.pretrain_vgg16_bn_cifar10_pruning_output.txt
+
+python test/pretrain_vgg16_bn_cifar10/00.pretrain_vgg16_bn_cifar10_grads_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_vgg16_bn_cifar10/00.pretrain_vgg16_bn_cifar10_grads_pruning_output.txt
+
+python test/pretain_resnet50_imagenet/00.pretrain_resnet50_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretain_resnet50_imagenet/00.pretrain_resnet50_imagenet_pruning_output.txt
+
+python test/pretain_resnet50_imagenet/00.pretrain_resnet50_imagenet_grads_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretain_resnet50_imagenet/00.pretrain_resnet50_imagenet_grads_pruning_output.txt
+
+python test/pretrain_resnet152_imagenet/00.pretrain_resnet152_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_resnet152_imagenet/00.pretrain_resnet152_imagenet_pruning_output.txt
+
+python test/pretrain_resnet152_imagenet/00.pretrain_resnet152_imagenet_grads_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_resnet152_imagenet/00.pretrain_resnet152_imagenet_grads_pruning_output.txt
+
+python test/pretrain_desenet121_imagenet/00.pretrain_densenet121_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_densenet121_imagenet/00.pretrain_densenet121_imagenet_pruning_output.txt
+
+python test/pretrain_VIT_imagenet/00.pretrain_vit_base_patch16_224_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_VIT_imagenet/00.pretrain_vit_base_patch16_224_imagenet_pruning_output.txt
+
+python /workspace/UniPruning/test/ConvNeXt/00.pretrain_convnextv2_huge.fcmae_ft_in22k_in1k_512_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/ConvNeXt/00.pretrain_convnextv2_huge.fcmae_ft_in22k_in1k_512_imagenet_pruning_output.txt
+
+python /workspace/UniPruning/test/ConvNeXt/00.pretrain_convnextv2_base.fcmae_ft_in22k_in1k_pruning.py 2>&1 | tee /workspace/UniPruning/test/ConvNeXt/00.pretrain_convnextv2_base.fcmae_ft_in22k_in1k_pruning_output.txt
+
+
+python /workspace/UniPruning/test_new/MobileNet/00.pretrain_mobilenet_v2_1.0_224_imagenet_grads_importants_weight_update_cric_pruning.py 2>&1 | tee /workspace/UniPruning/test_new/MobileNet/00.pretrain_mobilenet_v2_1.0_224_imagenet_grads_importants_weight_update_cric_pruning_sparsity_output.py
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+python test/pretrain_VIT_imagenet/02.pretrain_deit_base_patch16_224_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_VIT_imagenet/02.pretrain_deit_base_patch16_224_imagenet_pruning_output.txt
+
+python test/pretrain_VIT_imagenet/02.pretrain_deit_base_patch16_224_imagenet_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_VIT_imagenet/02.pretrain_deit_base_patch16_224_imagenet_pruning_output.txt
+
+python test/pretain_RWKV/00.pretrain_RWKV_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretain_RWKV/00.pretrain_RWKV_pruning_output.txt
+
+python test/llama1/00.pretrain_llamav1_pruning.py 2>&1 | tee /workspace/UniPruning/test/llama1/00.pretrain_llamav1_pruning_output.txt
+
+python /workspace/UniPruning/test_new/Bert/00.pretrain_Bert_SQuad_grads_pruning.py 2>&1 | tee /workspace/UniPruning/test_new/Bert/00.pretrain_Bert_SQuad_grads_pruning_output.txt
+
+python test/llama2/00.pretain_llamav2_pruning.py 2>&1 | tee /workspace/UniPruning/test/llama2/00.pretrain_llamav2_pruning_output.txt
+
+python test/llama3/00.pretain_llama3_pruning.py 2>&1 | tee /workspace/UniPruning/test/llama3/00.pretrain_llama3_pruning_output.txt
+
+python test/llama3/00.pretain_llama3_pruning.py 2>&1 | tee /workspace/UniPruning/test/llama3/00.pretrain_llama3_pruning_output.txt
+
+python test/pretrain_yolov5/00.pretain_yolo5_pruning.py 2>&1 | tee /workspace/UniPruning/test/pretrain_yolov5/00.pretrain_yolo5_pruning_output.txt
+
+
+
+
+
+python /workspace/UniPruning/test/pretrain_yolov5/model/yolov5/val.py   --weights /workspace/UniPruning/test/pretrain_yolov5/model/yolov5l6.pt  --data /workspace/UniPruning/test/pretrain_yolov5/model/yolov5/my_coco128.yaml  --imgsz 1280    --batch-size 16 --device 0  --task val
+
+
+
+
+
+
+
+
+使用accelerate库来使用多GPU加速训练：
+accelerate launch --config_file /workspace/UniPruning/test/pretrain_resnet152_imagenet/00.pretrain_resnet152_imagenet_grads_gpus_pruning.yaml /workspace/UniPruning/test/pretrain_resnet152_imagenet/00.pretrain_resnet152_imagenet_grads_gpus_pruning.py
+
+
+
+vit_base_patch16_224_imagenet健全性测试: 
+python /workspace/UniPruning/test/pretrain_VIT_imagenet/00.vit_base_patch16_224_sanity_check.py
+
+指定gpu运行程序：
+CUDA_VISIBLE_DEVICES=0 python /workspace/UniPruning/test/llama1/00.pretrain_llamav1_grads_pruning.py
+
+
+
+在screen里运行程序（和在外面终端运行不一样）：
+例如：
+python -u 
+/workspace/UniPruning/test_new/pretain_resnet50_imagenet/00.
+resnet50_imagenet_grads_importants_weight_update_cric_pruning.py 
+2>&1 | tee -a 
+/workspace/UniPruning/test_new/
+resnet50_imagenet/00.pretrain_resnet50_imagenet_grads_importants_weight_update_cric_sparsity0.3.txt
+
+
+
+

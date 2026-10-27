@@ -1,0 +1,73 @@
+required_fields:
+  - config_status
+  - experiment_id
+  - lifecycle_status
+  - deferred_reason
+  - base_model
+  - replacement
+  - finetune
+  - export
+  - outputs
+
+fields:
+  config_status: placeholder_not_verified | verified
+  placeholder_rule: when config_status is placeholder_not_verified, string_or_null fields may be null; when config_status is verified, verified_rules below override placeholders.
+  experiment_id: string
+  lifecycle_status: deferred_future_optimization | active
+  deferred_reason: string_or_null
+  base_model: string
+  replacement:
+    required:
+      - original_module
+      - replacement_module
+      - affected_layers
+      - expected_operator_delta
+      - expected_backend_support
+    fields:
+      original_module: string_or_null
+      replacement_module: string_or_null
+      affected_layers: list
+      expected_operator_delta: list
+      expected_backend_support:
+        required: [jetson_8gb, rk3588_8gb, rdk_x5_8gb]
+  finetune:
+    required: [seed, epochs, batch_size, learning_rate]
+    fields:
+      seed: integer
+      epochs: integer
+      batch_size: integer
+      learning_rate: number
+  export:
+    required: [opset, dynamic, nms]
+    fields:
+      opset: integer
+      dynamic: boolean
+      nms: boolean
+  outputs:
+    required: [checkpoint_dir, raw_train_dir, raw_eval_dir]
+    fields:
+      checkpoint_dir: string
+      raw_train_dir: string
+      raw_eval_dir: string
+
+verified_rules:
+  when:
+    config_status: verified
+  then:
+    - replacement.original_module must be non-empty.
+    - replacement.replacement_module must be non-empty.
+    - replacement.affected_layers must be non-empty.
+    - replacement.expected_backend_support.jetson_8gb must be non-empty.
+    - replacement.expected_backend_support.rk3588_8gb must be non-empty.
+    - replacement.expected_backend_support.rdk_x5_8gb must be non-empty.
+    - finetune.epochs and finetune.batch_size must be greater than 0.
+    - finetune.learning_rate must be greater than 0.
+    - lifecycle_status must be active before any structure replacement run can be selected for a formal result.
+
+deferred_rules:
+  when:
+    lifecycle_status: deferred_future_optimization
+  then:
+    - config_status must remain placeholder_not_verified.
+    - deferred_reason must be non-empty.
+    - no structure replacement run is required for the current project acceptance matrix.

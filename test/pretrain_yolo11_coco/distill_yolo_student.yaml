@@ -1,0 +1,29 @@
+experiment_id: "distill_yolo_student_v1"
+config_status: placeholder_not_verified
+teacher_student_config: "projects/06_model_compression/configs/teacher_student/teacher_student.yaml"
+seed: 42
+teacher:
+  source: "models/yolo11n/source/yolo11n.pt"
+  role: "unpruned_yolo11n_frozen"
+student:
+  source_pattern: "models/compressed/pruned/<prune_run_id>/best.pt"
+  role: "finetuned_pruned_yolo11n"
+  prune_ratio_matrix: [0.10, 0.30]
+  minimum_required_ratio: 0.30
+comparison_baseline: "same_ratio_finetuned_pruned_model"
+epochs: 0
+batch_size: 0
+optimizer:
+  name: null
+  learning_rate: 0.0
+distillation:
+  type: "logits"
+  temperature: 4.0
+  loss_weights:
+    task: 1.0
+    logits: 1.0
+    feature: 0.0
+outputs:
+  checkpoint_dir: "models/compressed/distilled/"
+  raw_train_dir: "benchmark/raw/06_model_compression/train/"
+  raw_eval_dir: "benchmark/raw/06_model_compression/eval/"

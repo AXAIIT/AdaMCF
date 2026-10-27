@@ -1,0 +1,27 @@
+experiment_id: "replace_yolo_block_v1"
+config_status: placeholder_not_verified
+lifecycle_status: deferred_future_optimization
+deferred_reason: "current phase prioritizes YOLO11n 10/30/50 percent structured pruning and post-pruning distillation"
+base_model: "models/compressed/student_baseline/"
+replacement:
+  original_module: null
+  replacement_module: null
+  affected_layers: []
+  expected_operator_delta: []
+  expected_backend_support:
+    jetson_8gb: null
+    rk3588_8gb: null
+    rdk_x5_8gb: null
+finetune:
+  seed: 42
+  epochs: 0
+  batch_size: 0
+  learning_rate: 0.0
+export:
+  opset: 12
+  dynamic: false
+  nms: false
+outputs:
+  checkpoint_dir: "models/compressed/structure_replaced/"
+  raw_train_dir: "benchmark/raw/06_model_compression/train/"
+  raw_eval_dir: "benchmark/raw/06_model_compression/eval/"

@@ -1,4 +1,4 @@
-from .tensor_transform import TensorTransform
+from .tensor_transform import TensorTransform, is_index_groups_transform
 
 
 def index_transformation_param_group(indexes_by_groups, transformation_type, param_group):
@@ -13,18 +13,35 @@ def index_transformation_param_group(indexes_by_groups, transformation_type, par
     返回:
         经过转换后的索引列表
     """
+    logical_indexes = [int(index) for index in indexes_by_groups]
+    num_groups = int(param_group.get('num_groups', 0))
+    invalid_indexes = [index for index in logical_indexes if index < 0 or index >= num_groups]
+    if invalid_indexes:
+        raise IndexError(
+            f'逻辑剪枝索引越界：indexes={invalid_indexes}, num_groups={num_groups}。'
+        )
+
+    if is_index_groups_transform(transformation_type):
+        index_groups = transformation_type.get('index_groups', [])
+        if len(index_groups) != num_groups:
+            raise ValueError(
+                f'INDEX_GROUPS 逻辑组数量不匹配：contract={len(index_groups)}, '
+                f'param_group={num_groups}。'
+            )
+        refined_indexes = []
+        for logical_index in logical_indexes:
+            refined_indexes.extend(int(index) for index in index_groups[logical_index])
+        return sorted(set(refined_indexes))
     if transformation_type == TensorTransform.MULTIHEAD_HEADDIM:
-        refined_indexes = index_transformation(indexes_by_groups, transformation_type, num_heads=param_group['num_heads'], head_dim=param_group['head_dim'])
+        refined_indexes = index_transformation(logical_indexes, transformation_type, num_heads=param_group['num_heads'], head_dim=param_group['head_dim'])
     elif transformation_type == TensorTransform.MULTIHEAD_NUMHEAD or transformation_type == TensorTransform.MULTIHEAD_NUMHEAD_SPREAD:
-        refined_indexes = index_transformation(indexes_by_groups, transformation_type, head_dim=param_group['head_dim'])
+        refined_indexes = index_transformation(logical_indexes, transformation_type, head_dim=param_group['head_dim'])
     else:
-        refined_indexes = index_transformation(indexes_by_groups, transformation_type)
+        refined_indexes = index_transformation(logical_indexes, transformation_type)
 
-    # 确保索引合法
-    max_index = param_group.get('num_groups', float('inf'))  # 获取参数组的最大索引范围
-    refined_indexes = [i for i in refined_indexes if 0 <= i < max_index]
-
-    return refined_indexes
+    # 注意：这里只校验逻辑索引。MULTIHEAD/INDEX_GROUPS 展开后的值是物理参数索引，
+    # 其上限通常远大于 num_groups，不能再次按 num_groups 截断。
+    return sorted(set(int(index) for index in refined_indexes))
 
 def index_transformation(indexes_by_groups, transformation_type, num_heads=1, head_dim=1):
     """

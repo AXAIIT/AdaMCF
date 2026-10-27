@@ -1,6 +1,8 @@
 # 引入IntEnum用于创建整数枚举类型
 from enum import IntEnum
 
+import torch
+
 # 定义张量变换类型的枚举类，用于标识不同的变换操作
 class TensorTransform(IntEnum):
     NO_UPDATE = 0                               # 不进行任何更新操作
@@ -15,8 +17,86 @@ class TensorTransform(IntEnum):
     TRANSPOSE = 9                               # 转置变换操作
     MULTIHEAD_NUMHEAD_SPREAD = 10               # 多头注意力中头数量的扩散变换，会影响同一节点组中的其他节点
     REVERSE_MULTIHEAD_NUMHEAD_SPREAD = 11       # 多头注意力中头数量的反向扩散变换，会影响同一节点组中的其他节点
+    INDEX_GROUPS = 12                           # 一个逻辑组映射到一组显式物理索引（可位于任意参数轴）
 
-    TOTAL = 12                                  # 变换类型的总数
+    TOTAL = 13                                  # 变换类型的总数
+
+
+INDEX_GROUPS_CONTRACT = 'index_groups_v1'
+
+
+def make_index_groups_transform(index_groups, axis=0):
+    """构造显式逻辑组到物理索引的通用变换合同。
+
+    ``index_groups[g]`` 列出逻辑组 ``g`` 在当前参数 ``axis`` 上对应的所有
+    物理索引。该合同用于 Q/K/V 等非连续或非等宽分区，避免把具体模型布局
+    硬编码进 HESSO 优化器。
+    """
+    return {
+        'contract': INDEX_GROUPS_CONTRACT,
+        'transform': int(TensorTransform.INDEX_GROUPS),
+        'axis': int(axis),
+        'index_groups': [[int(index) for index in group] for group in index_groups],
+    }
+
+
+def is_index_groups_transform(transformation_type):
+    return (
+        isinstance(transformation_type, dict)
+        and transformation_type.get('contract') == INDEX_GROUPS_CONTRACT
+        and int(transformation_type.get('transform', -1)) == int(TensorTransform.INDEX_GROUPS)
+    )
+
+
+def pruning_axis(transformation_type):
+    """返回参数组稀疏置零/缩放应操作的物理轴。"""
+    if is_index_groups_transform(transformation_type):
+        return int(transformation_type.get('axis', 0))
+    if transformation_type == TensorTransform.TRANSPOSE:
+        return 1
+    return 0
+
+
+def _validate_index_groups_transform(tensor, transformation_type, num_groups):
+    index_groups = transformation_type.get('index_groups')
+    if not isinstance(index_groups, list) or not index_groups:
+        raise ValueError('INDEX_GROUPS.index_groups 必须是非空列表。')
+    if len(index_groups) != int(num_groups):
+        raise ValueError(
+            f'INDEX_GROUPS 逻辑组数量不匹配：contract={len(index_groups)}, '
+            f'param_group={num_groups}。'
+        )
+    group_widths = {len(group) for group in index_groups}
+    if 0 in group_widths or len(group_widths) != 1:
+        raise ValueError('同一参数的 INDEX_GROUPS 每个逻辑组必须包含相同数量的物理索引。')
+    axis = pruning_axis(transformation_type)
+    if axis < 0:
+        axis += tensor.dim()
+    if axis < 0 or axis >= tensor.dim():
+        raise ValueError(f'INDEX_GROUPS.axis={axis} 超出参数维数 {tensor.dim()}。')
+    flat_indexes = [int(index) for group in index_groups for index in group]
+    if len(set(flat_indexes)) != len(flat_indexes):
+        raise ValueError('INDEX_GROUPS 中的物理索引必须互不重叠。')
+    if min(flat_indexes) < 0 or max(flat_indexes) >= tensor.shape[axis]:
+        raise IndexError(
+            f'INDEX_GROUPS 物理索引越界：axis={axis}, size={tensor.shape[axis]}, '
+            f'range=[{min(flat_indexes)}, {max(flat_indexes)}]。'
+        )
+    return index_groups, axis
+
+
+def index_groups_transformation(tensor, transformation_type, num_groups):
+    """按显式物理索引收集参数，返回 ``[num_groups, -1]``。"""
+    index_groups, axis = _validate_index_groups_transform(
+        tensor, transformation_type, num_groups
+    )
+    transformed_groups = []
+    for group in index_groups:
+        indexes = torch.as_tensor(group, dtype=torch.long, device=tensor.device)
+        transformed_groups.append(
+            torch.index_select(tensor, axis, indexes).contiguous().reshape(-1)
+        )
+    return torch.stack(transformed_groups, dim=0)
 
 # 判断给定的变换类型是否为扩散型变换（影响同组其他节点的变换）
 def is_spread_transformation(transformation_type):
@@ -40,6 +120,9 @@ SPREAD_TRANSFORM_MAP = {
 #   num_heads: 头数量
 #   head_dim: 头维度大小
 def tensor_transformation(tensor, transformation_type, num_groups=1, num_heads=1, head_dim=1):
+    # 显式索引组合同优先于枚举分支；其物理布局由算子声明，优化器保持模型无关。
+    if is_index_groups_transform(transformation_type):
+        return index_groups_transformation(tensor, transformation_type, num_groups)
     # 对于无更新或无剪枝操作，直接返回原始张量
     if transformation_type == TensorTransform.NO_UPDATE or \
        transformation_type == TensorTransform.NO_PRUNE:

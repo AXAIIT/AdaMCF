@@ -1,0 +1,83 @@
+# P30 全量开放物理结构化子网的直接恢复：QualityFG 预测级 KD（A3）与 matched no-KD control。
+# 此配置不覆盖 A1/A2：它回答“KD 是否应在剪枝后恢复阶段介入”的独立问题。
+config_status: "short_paired_completed_below_effect_gate; no_80_epoch_escalation"
+experiment_family: "Y11-QualityFG-PredDFL-KD-v3-StructuredRecovery"
+implementation: "legacy_8_3_246_preddfl_paired_control_v2_optional_qualityfg"
+teacher_student_config: "projects/06_model_compression/configs/teacher_student/teacher_student.yaml"
+seed: 42
+
+teacher:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt"
+  sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+  role: "unpruned_yolo11n_frozen"
+  frozen: true
+student:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1_prune5/weights/yolo11n_all_verified_safe_num_head_v4_output_closure_structured.pt"
+  sha256: "def26aa4c74d0b8eabd1db6c93ad3121b45a86117236ec0e8f32cdfebdeb0280"
+  role: "P30_post_prune_structured_physical_student_before_recovery"
+  structure_sha256: "72bc0bf5f5ce97bfae2b3326097246ba9152bd449049d672d767b6d40ace8ed0"
+  baseline_validation:
+    map50: 0.521116840916522
+    map50_95: 0.36020353402151445
+
+# QualityFG 是预测级 KD 的选点/加权组件，不含 Neck projector 或其他特征蒸馏分支。
+qualityfg_mask:
+  contract: "gt_inside_teacher_cls_times_decoded_dfl_iou_per_gt_cross_scale_topk_v2"
+  selection_mode: "quality_fg_v2"
+  quality_topk_per_gt: 15
+  quality_weight: "per_gt_topk_q_normalized_to_sum_K_overlap_uses_max"
+  q_definition: "max_class_sigmoid_score * decoded_DFL_box_iou_to_GT"
+  tiny_gt_fallback: "nearest_P3_center_with_explicit_counter"
+  gradients: "no_gradient_through_teacher_or_mask"
+
+prediction_kd:
+  cls_weight: 0.5
+  dfl_weight: 0.25
+  cls_temperature: 2.0
+  dfl_temperature: 2.0
+  kd_warmup_epochs: 5
+  confidence_threshold_unused_in_v3: 0.10
+  topk_per_image_unused_in_v3: 100
+  loss: "L_det + warmup*(0.5*L_clsKD + 0.25*L_dflKD)*batch_size"
+
+admission:
+  run_epochs: 1
+  requirement: "QualityFG unit/parity pass + first_nonzero_KD_optimizer_step + frozen_teacher + pure_student_checkpoint + physical_structure_unchanged"
+  observed_run_id: "20260728_yolo11n_p30_structured_recovery_qualityfg_kd_admission_e1_v1"
+  result: "pass; teacher_gradients=0, student_kd_gradients=255/255, pure_checkpoint=true, structure_and_fixed_forward=true"
+short_paired_screen:
+  run_epochs: 20
+  quality_gate_primary: "KD_minus_control_map50_95 >= +0.30pp"
+  control: "same structured source/data/seed/optimizer/lr/epochs/batch/augmentation; KD losses disabled"
+  kd: "only Prediction KD plus QualityFG mask enabled"
+formal_validation:
+  run_epochs: 80
+  prerequisite: "short_paired_screen passes; current result does not pass, so this stage is not authorized"
+  additional_requirement: "at_least_3_seeds_after_the_first_80epoch_pair"
+
+# lr0=0.001 复制 P30 历史普通恢复的已验证训练合同；不是为 KD 任意提高学习率。
+training_contract:
+  imgsz: 640
+  batch: 64
+  workers: 12
+  optimizer: "SGD"
+  lr0: 0.001
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 0
+  close_mosaic: 20
+  amp: false
+checkpoint_contract: "physical_student_only_v1"
+comparison_tool: "scripts/compare_yolo11_distillation_runs.py"
+observed_short_paired_result:
+  control_run_id: "20260728_yolo11n_p30_structured_recovery_qualityfg_nokd_ctrl_e20_v1"
+  kd_run_id: "20260728_yolo11n_p30_structured_recovery_qualityfg_preddfl_kd_e20_v1"
+  paired_comparison_status: "pass"
+  control_map50: 0.5263664149170809
+  control_map50_95: 0.3673734389039602
+  kd_map50: 0.5278593912719298
+  kd_map50_95: 0.368244482041063
+  kd_minus_control_map50_pp: 0.14929763548489072
+  kd_minus_control_map50_95_pp: 0.08710431371028449
+  primary_effect_gate_pp: 0.30
+  decision: "below_gate_do_not_escalate_to_80_epochs_or_multi_seed"

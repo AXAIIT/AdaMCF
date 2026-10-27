@@ -1,0 +1,84 @@
+# D2：针对物理剪枝 Detect 内部异宽的 CrossKD 风格跨头代理蒸馏。
+# D1 直接复用教师尾部的前置合同在 P30 上被正确拒绝：学生 P3 regression 中间
+# 宽度为 39，而教师尾部输入为 64。本配置以显式、训练期 1×1 通道适配器解决
+# 该结构差异；适配器绝不写入部署 checkpoint。
+config_status: "20epoch_strict_pair_completed_below_matched_control_frozen"
+experiment_family: "Y11-CrossHeadAdapter-QualityFG-PredDFL-KD-v2"
+implementation: "legacy_8_3_246_yolo11_detect_cross_head_proxy_adapter_v2"
+predecessor: "Y11-CrossHead-QualityFG-PredDFL-KD-v1_direct_tail_rejected_by_channel_contract"
+seed: 42
+
+teacher:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/models/yolo11n.pt"
+  sha256: "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1"
+  role: "unpruned_yolo11n_frozen"
+  frozen: true
+student:
+  source: "/workspace/OTOv2_v2/test/pretrain_yolo11_coco/runs/20260723_yolo11n_all_verified_safe_num_head_v4_output_closure_p30_e90_w10_ft80_v1_finetune1/weights/best.pt"
+  sha256: "f35bc5eb8a2c67150c1f2203b1d7d6b9b8a32fcc4d451d1fb4e21f9a091e94ca"
+  role: "P30_S0_finetuned_physical_student"
+  structure_sha256: "72bc0bf5f5ce97bfae2b3326097246ba9152bd449049d672d767b6d40ace8ed0"
+  baseline_validation:
+    map50: 0.5294577071263171
+    map50_95: 0.3713838395714083
+
+cross_head:
+  enabled: true
+  start_layer: 1
+  student_capture: "Detect.cv2/cv3 第 1 层后的 P3/P4/P5 中间特征"
+  channel_adapter:
+    policy: "异宽显式 Conv1x1；同宽 Identity；训练期专用"
+    initialization: "重叠通道恒等映射，其余输出通道置零"
+    registration: "optimizer 创建前挂载到 student._distill_cross_head_adapters"
+    gradient_gate: "KD 首步必须同时命中物理学生与全部可训练适配器"
+    checkpoint: "保存前剥离；YOLO(best.pt) 只包含物理学生"
+  teacher_proxy: "适配后送入冻结教师 Detect.cv2/cv3 对应第 2 层至输出层"
+  output: "三尺度 cross-head raw logits [N, 144, H, W]"
+  rationale: "保留 CrossKD 的代理预测与监督解耦，同时显式处理结构化剪枝后的 Detect 内部异宽。"
+
+prediction_distillation:
+  selection_mode: "quality_fg_v2"
+  contract: "gt_inside_teacher_cls_times_decoded_dfl_iou_per_gt_cross_scale_topk_v2"
+  quality_topk_per_gt: 15
+  cls_weight: 0.5
+  dfl_weight: 0.25
+  cls_temperature: 2.0
+  dfl_temperature: 2.0
+  warmup_epochs: 5
+
+training_contract:
+  imgsz: 640
+  batch: 64
+  workers: 12
+  optimizer: "SGD"
+  lr0: 0.0005
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 0
+  close_mosaic: 20
+  amp: false
+
+admission:
+  unit_test: "three_scale_cross_head_adapter_raw_shape_and_finiteness_pass"
+  run_epochs: 1
+  requirement: "teacher_frozen + adapter_optimizer_ownership + cross_head_KD_gradient_on_physical_student_and_adapter + pure_student_checkpoint + fixed_forward"
+screening:
+  run_epochs: 20
+  control: "同脚本、同起点、同参数、同适配器参数组；仅关闭 cross-head KD"
+  promotion_gate: "mAP@0.5:0.95 相对 matched no-KD control >= +0.30pp，且不得低于 P30 S0 的 37.1384%"
+checkpoint_contract: "physical_student_only_v1"
+observed_admission:
+  unit_run_id: "20260730_yolo11n_p30_crosshead_adapter_v2_contract_r2"
+  one_epoch_run_id: "20260730_yolo11n_p30_crosshead_adapter_v2_admission_e1_r1"
+  result: "pass; 6 adapters optimizer-owned and gradient-active, 255 physical student parameters gradient-active, teacher gradients=0, pure checkpoint and fixed forward pass"
+observed_short_paired_result:
+  control_run_id: "20260730_yolo11n_p30_crosshead_adapter_qualityfg_nokd_ctrl_e20_v1"
+  kd_run_id: "20260730_yolo11n_p30_crosshead_adapter_qualityfg_kd_e20_v1"
+  paired_comparison_status: "pass"
+  control_map50: 0.5312292241960803
+  control_map50_95: 0.3722349397436311
+  kd_map50: 0.5302824142040882
+  kd_map50_95: 0.37041989585819723
+  kd_minus_control_map50_pp: -0.0946809991992148
+  kd_minus_control_map50_95_pp: -0.18150438854338535
+  decision: "below_noninferiority_gate_do_not_escalate_or_tune"

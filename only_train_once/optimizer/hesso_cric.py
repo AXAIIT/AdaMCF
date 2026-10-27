@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from torch.optim.optimizer import required
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
-from only_train_once.transform import tensor_transformation, TensorTransform, index_transformation_param_group
+from only_train_once.transform import tensor_transformation, TensorTransform, index_transformation_param_group, pruning_axis
 
 class HESSOCRIC(BaseHybridSparseOptimizer):
     """
@@ -237,13 +237,18 @@ class HESSOCRIC(BaseHybridSparseOptimizer):
         num_redund_grps = max(min(int(param_group['num_groups'] * trial_group_sparsity), param_group['num_groups']), 1)
         # 根据总体重要性分数，找到最不重要的组的索引
         _, proj_indices = torch.topk(-param_group['importance_scores']['overall'], num_redund_grps)
-        proj_indices = proj_indices.cpu().numpy().tolist()
+        logical_proj_indices = proj_indices.cpu().numpy().tolist()
         # 遍历该组中的所有参数张量及其变换方式
         for (p, p_transform) in zip(param_group['params'], param_group['p_transform']):
             # 对索引进行可能的变换（例如，对于多头注意力的 head dim）
-            proj_indices = index_transformation_param_group(proj_indices, p_transform, param_group)
+            # 每个参数的 INDEX_GROUPS/MHA 变换都必须从同一组“逻辑索引”独立
+            # 展开。旧代码把首个参数的物理索引回写后再交给第二个参数，会把
+            # 物理索引误当逻辑索引并触发越界，也会影响既有 ViT 多参数组。
+            proj_indices = index_transformation_param_group(
+                logical_proj_indices, p_transform, param_group
+            )
             # 根据张量的形状和变换方式，将对应索引的权重清零
-            if p_transform == TensorTransform.TRANSPOSE and len(p.data.shape) > 1:
+            if pruning_axis(p_transform) == 1 and len(p.data.shape) > 1:
                 # 对于需要转置处理的二维以上张量（如某些线性层）
                 p.data[:, proj_indices, ...] = 0.0
             else:
@@ -305,7 +310,7 @@ class HESSOCRIC(BaseHybridSparseOptimizer):
                     # 对被识别为“违反约束”的组的权重进行缩放
                     # 这个缩放操作是为了逐渐减小这些组的权重，模拟剪枝效果
                     scaling_factor = (self.sampling_steps - t - 1.0) / (self.sampling_steps - t)
-                    if p_transform == TensorTransform.TRANSPOSE and len(p.data.shape) > 1:
+                    if pruning_axis(p_transform) == 1 and len(p.data.shape) > 1:
                         p.data[:, group['active_violating_idxes'], ...] *= scaling_factor
                     else:
                         p.data[group['active_violating_idxes']] *= scaling_factor
@@ -393,7 +398,7 @@ class HESSOCRIC(BaseHybridSparseOptimizer):
                     # 计算一个缩放因子，该因子会随着 t 的增加从接近 1 逐渐变为 0
                     scaling_factor = (self.hybrid_training_steps - t - 1.0) / (self.hybrid_training_steps - t)
                     # 对冗余组的权重应用缩放，使其逐渐衰减
-                    if p_transform == TensorTransform.TRANSPOSE and len(p.data.shape) > 1:
+                    if pruning_axis(p_transform) == 1 and len(p.data.shape) > 1:
                         p.data[:, active_redundant_idxes, ...] *= scaling_factor
                     else:
                         p.data[active_redundant_idxes] *= scaling_factor
@@ -665,4 +670,3 @@ class HESSOCRIC(BaseHybridSparseOptimizer):
 
         # 返回包含所有计算好的指标的对象
         return self.opt_metrics
-

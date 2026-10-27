@@ -1,0 +1,39 @@
+{
+  "architecture": "convnextv2_huge",
+  "num_classes": 1000,
+  "num_features": 2816,
+  "pretrained_cfg": {
+    "tag": "fcmae_ft_in22k_in1k_512",
+    "custom_load": false,
+    "input_size": [
+      3,
+      512,
+      512
+    ],
+    "fixed_input_size": false,
+    "interpolation": "bicubic",
+    "crop_pct": 1.0,
+    "crop_mode": "squash",
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "num_classes": 1000,
+    "pool_size": [
+      15,
+      15
+    ],
+    "first_conv": "stem.0",
+    "classifier": "head.fc",
+    "license": "cc-by-nc-4.0",
+    "origin_url": "https://github.com/facebookresearch/ConvNeXt-V2",
+    "paper_name": "ConvNeXt-V2: Co-designing and Scaling ConvNets with Masked Autoencoders",
+    "paper_ids": "arXiv:2301.00808"
+  }
+}

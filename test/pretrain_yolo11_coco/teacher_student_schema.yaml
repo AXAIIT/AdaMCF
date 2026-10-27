@@ -1,0 +1,86 @@
+required_fields:
+  - config_status
+  - experiment_id
+  - dataset
+  - teacher
+  - student
+  - role_relationship
+  - quality_gate
+  - edge_target
+  - export
+
+fields:
+  config_status: placeholder_not_verified | verified
+  placeholder_rule: when config_status is placeholder_not_verified, string_or_null fields may be null; when config_status is verified, verified_rules below override placeholders.
+  experiment_id: string
+  dataset:
+    required:
+      - train_manifest
+      - val_manifest
+      - fixed_input_set_manifest
+      - dataset_id
+    fields:
+      train_manifest: string
+      val_manifest: string
+      fixed_input_set_manifest: string
+      dataset_id: string_or_null
+  teacher:
+    required: [name, checkpoint, hash, metric_name, role]
+    fields:
+      name: string_or_null
+      checkpoint: string
+      hash: sha256_or_null
+      metric_name: string
+      role: frozen_teacher_for_pruned_students
+  student:
+    required: [name, checkpoint, hash, metric_name, role]
+    fields:
+      name: string_or_null
+      checkpoint: string
+      hash: sha256_or_null
+      metric_name: string
+      role: unpruned_student_baseline
+  role_relationship:
+    required: [same_unpruned_checkpoint_required, distillation_student_source, distillation_student_ratios]
+    fields:
+      same_unpruned_checkpoint_required: boolean
+      distillation_student_source: string
+      distillation_student_ratios: list
+  quality_gate:
+    required:
+      - max_drop_vs_teacher_pct
+      - distilled_min_delta_vs_student_pct
+    fields:
+      max_drop_vs_teacher_pct: number
+      distilled_min_delta_vs_student_pct: number
+  edge_target:
+    required:
+      - min_p95_improvement_pct
+      - min_model_size_reduction_pct
+    fields:
+      min_p95_improvement_pct: number
+      min_model_size_reduction_pct: number
+  export:
+    required: [input_size, opset, dynamic, nms]
+    fields:
+      input_size: integer
+      opset: integer
+      dynamic: boolean
+      nms: boolean
+
+verified_rules:
+  when:
+    config_status: verified
+  then:
+    - teacher.name must be non-empty.
+    - teacher.hash must match ^[a-fA-F0-9]{64}$.
+    - student.name must be non-empty.
+    - student.hash must match ^[a-fA-F0-9]{64}$.
+    - teacher.checkpoint and student.checkpoint must reference the same unpruned YOLO11n checkpoint.
+    - teacher.hash and student.hash must be identical.
+    - role_relationship.same_unpruned_checkpoint_required must be true.
+    - role_relationship.distillation_student_ratios must equal [0.10, 0.30] for the current scope; P50 is not a required distillation student.
+    - dataset.dataset_id must be non-empty.
+    - dataset.train_manifest, dataset.val_manifest, and dataset.fixed_input_set_manifest must be non-empty.
+    - quality_gate.max_drop_vs_teacher_pct must be non-null.
+    - edge_target.min_p95_improvement_pct and edge_target.min_model_size_reduction_pct must be non-null.
