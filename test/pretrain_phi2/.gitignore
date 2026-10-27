@@ -1,0 +1,12 @@
+# 原始模型与运行产物不进入 Git，仅保留目录占位文件。
+/models/phi-2/*
+!/models/phi-2/.gitkeep
+/cache_phi2_pruned/*
+!/cache_phi2_pruned/.gitkeep
+/finetuned_models/*
+!/finetuned_models/.gitkeep
+/logs/*
+!/logs/.gitkeep
+!/runs/
+/runs/*
+!/runs/.gitkeep
