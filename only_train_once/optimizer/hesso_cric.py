@@ -4,10 +4,10 @@ from torch.optim.optimizer import required
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
 from only_train_once.transform import tensor_transformation, TensorTransform, index_transformation_param_group, pruning_axis
 
-class HESSOCRIC(BaseHybridSparseOptimizer):
+class _LegacyHESSOCRIC(BaseHybridSparseOptimizer):
     """
     HESSO-CRIC 优化器。
-    CRIC (Conflicting Rules in Implementation Checking) 是一种通过迭代测试来识别真正可剪枝组的方法。
+    CRIC (Corrective Redundant Identification Cycle) 通过采样和校正识别冗余组。
     它通过在多个周期内反复试探性地剪枝某些组，并观察其对模型性能（如损失）的影响，
     来确定哪些组是“违反约束”的（即重要的），哪些是冗余的。
     """
@@ -58,7 +58,7 @@ class HESSOCRIC(BaseHybridSparseOptimizer):
             self.importance_score_criteria = importance_score_criteria
 
         # 调用父类的构造函数，完成基础优化器的初始化
-        super(HESSOCRIC, self).__init__(params=params, variant=variant, lr=lr, first_momentum=first_momentum, second_momentum=second_momentum, \
+        super().__init__(params=params, variant=variant, lr=lr, first_momentum=first_momentum, second_momentum=second_momentum, \
                                         dampening=dampening, weight_decay=weight_decay, target_group_sparsity=target_group_sparsity, \
                                         group_divisible=group_divisible)
 
@@ -670,3 +670,12 @@ class HESSOCRIC(BaseHybridSparseOptimizer):
 
         # 返回包含所有计算好的指标的对象
         return self.opt_metrics
+
+
+# 阶段流程保留在上方；评分、α、索引修正及完整检查点由独立兼容层实现，
+# 避免为 CRIC 适配而改写 HESSO、公共基类或既有模型算子。
+from .cric_adapter import AdaptiveCRICMixin
+
+
+class HESSOCRIC(AdaptiveCRICMixin, _LegacyHESSOCRIC):
+    """使用 AdaMCF 五准则和周期边界 α 更新的 HESSO-CRIC。"""

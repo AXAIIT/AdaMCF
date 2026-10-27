@@ -175,7 +175,8 @@ class OTO:
     def hessocric(self, variant='sgd', lr=0.01, first_momentum=None, second_momentum=None, dampening=None, weight_decay=None, \
                 target_group_sparsity=0.5, tolerance=0, group_divisible=1, \
                 start_cric_step=0, max_cycle_period=10, sampling_steps=None, hybrid_training_steps=None, \
-                importance_score_criteria='default'):
+                importance_score_criteria='default', *, device=None,
+                alpha_scheduler_cfg=None, adaptive_alpha=True):
     
         from .optimizer import HESSOCRIC  # 动态导入 HESSOCric 优化器类
 
@@ -194,6 +195,9 @@ class OTO:
                                     sampling_steps=sampling_steps, 
                                     hybrid_training_steps=hybrid_training_steps,
                                     importance_score_criteria=importance_score_criteria,    # 重要性评分标准
+                                    device=device,
+                                    alpha_scheduler_cfg=alpha_scheduler_cfg,
+                                    adaptive_alpha=adaptive_alpha,
                                     )
         return self.optimizer                                      # 返回创建的优化器实例
     
