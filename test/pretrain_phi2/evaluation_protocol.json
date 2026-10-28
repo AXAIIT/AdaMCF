@@ -8,7 +8,9 @@
   "apply_chat_template_proposal": false,
   "backend_proposal": "pytorch_eager",
   "dtype_proposal": "float32",
-  "pruning_and_recovery_data_roles": "Alpaca/other approved training corpus; never the seven evaluation splits",
+  "pruning_and_recovery_data_roles": "Alpaca-only is functional smoke data; formal corpus must be aligned to author evidence first, never use the seven evaluation splits for training",
+  "formal_corpus_alignment_complete": false,
+  "formal_corpus_alignment_manifest": "corpus_alignment.json",
   "primary_average_proposal": "unweighted mean of seven task acc values; preserve acc_norm separately",
   "stages_to_compare": [
     "original_pretrained",
@@ -20,7 +22,7 @@
   "lora_policy": "attach LoRA only after physical pruning; freeze base; train A/B without a pruning optimizer",
   "training_data_issues": [
     "128-token proof truncation must be replaced by a frozen formal recipe",
-    "proof alpha=2 remains a smoke pool; new loader traverses the full frozen alpha pool with an independent shuffle seed and logs actual coverage",
+    "proof alpha=2 remains smoke data; shared optimizer alpha policy selects evaluation batches and records actual pool coverage",
     "new preprocessing filters empty responses; old manifests are unchanged",
     "check benchmark contamination before formal runs"
   ],

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
+from only_train_once.optimizer.alpha_data import AlphaBatch
 
 
 def file_sha256(path):
@@ -75,3 +76,10 @@ def collate_examples(rows, pad_token_id):
 
 def to_device(batch, device):
     return {key: value.to(device) for key, value in batch.items()}
+
+
+def collate_alpha_examples(rows, pad_token_id):
+    """只适配因果 LM 批次与元数据；取批/复用/覆盖由公共 α 调度器负责。"""
+    batch=collate_examples(rows,pad_token_id)
+    return AlphaBatch(batch,sample_ids=tuple(row['row_id'] for row in rows),
+                      supervised_tokens=int((batch['labels'][:,1:] != -100).sum()))

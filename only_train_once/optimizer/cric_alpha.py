@@ -1,7 +1,8 @@
 """CRIC 周期边界上的损失引导 α 更新，不改变原 HESSO 调度器。"""
 import math
 import torch
-from .alpha_scheduler import LossGuidedAlphaScheduler
+from .alpha_scheduler import LossGuidedAlphaScheduler, advance_alpha, alpha_boundary_confident
+from .alpha_data import select_alpha_batches, commit_alpha_selection
 
 
 class CRICAlphaScheduler(LossGuidedAlphaScheduler):
@@ -79,6 +80,7 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         if context is None or context['step'] == self._last_update_step:
             return False
         cfg = self.cfg
+        self.last_eval_stats = None
         cycle = context['round']
         if cycle < cfg.start_after_period or cycle % max(1, cfg.update_stride):
             return False
@@ -88,18 +90,11 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         backend.compute_importance_scores()
         scores = torch.cat(backend.global_scores).detach()
         k = backend.target_num_redundant_groups
-        if 0 < k < scores.numel():
-            ordered = scores.sort().values
-            gap = (ordered[k] - ordered[k - 1]).abs()
-            if gap / scores.std(unbiased=False).clamp_min(1e-8) > cfg.min_gap_std:
-                return False
+        if alpha_boundary_confident(scores,k,cfg.min_gap_std):
+            return False
 
-        batches = list(inputs) if isinstance(inputs, (list, tuple)) else [(inputs, targets)]
-        if not batches or any(not isinstance(b, (list, tuple)) or len(b) != 2 for b in batches):
-            raise ValueError('CRIC α: 微批必须是非空的 (inputs, targets) 列表。')
-        count = min(len(batches), cfg.eval_batch_limit,
-                    1 + max(0, cycle - cfg.start_after_period) // max(1, cfg.eval_batch_grow_every))
-        selected = [batches[(self._eval_cursor + i) % len(batches)] for i in range(count)]
+        selected = select_alpha_batches(inputs,targets,cycle,cfg,self.device,self._eval_cursor)
+        count = len(selected)
         ratio = 0.7 if context['warmup'] else (cfg.eval_drop_ratio or 0.0)
         old_alpha = self.alpha.clone()
 
@@ -107,7 +102,8 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
             backend._reaggregate_overall_from_alpha(alpha)
             plan = backend._dry_pick_active_by_alpha(alpha)
             values = []
-            for vx, vy in selected:
+            for batch in selected:
+                vx,vy=batch.inputs,batch.targets
                 backups = []
                 modes = [(module, module.training) for module in model.modules()]
                 buffers = [(buf, buf.detach().clone()) for buf in model.buffers()]
@@ -134,7 +130,10 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
                         buffer.copy_(saved)
                     for module, was_training in modes:
                         module.training = was_training
-            return torch.stack(values).mean()
+            # 与 HESSO 保持同一累加顺序，不额外引入 mean kernel 的舍入差异。
+            total=0.0
+            for value in values:total+=value
+            return total/len(values)
 
         try:
             gradient = torch.zeros_like(self.alpha)
@@ -148,33 +147,19 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
             if not torch.isfinite(gradient).all():
                 raise ValueError('CRIC α: 有限差分梯度不是有限值。')
 
-            # 下列 EMA、动量、单纯形归一化及 L1 信赖域规则与 HESSO 一致。
-            new_g_ema = cfg.g_ema_gamma * self.g_ema + (1 - cfg.g_ema_gamma) * gradient
-            effective = new_g_ema if cfg.g_ema_gamma > 0 else gradient
-            new_m = cfg.momentum * self.m + (1 - cfg.momentum) * effective if cfg.momentum > 0 else effective
-            proposal = (self.alpha - cfg.lr * new_m).clamp_min(1e-8)
-            proposal /= proposal.sum()
-            if cfg.max_step_l1 is not None and cfg.max_step_l1 > 0:
-                delta = proposal - self.alpha
-                delta *= min(1.0, cfg.max_step_l1 / (delta.abs().sum().item() + 1e-12))
-                proposal = (self.alpha + delta).clamp_min(1e-8)
-                proposal /= proposal.sum()
-            new_alpha = ((1 - cfg.ema_gamma) * self.alpha + cfg.ema_gamma * proposal
-                         if cfg.ema_gamma > 0 else proposal)
-            new_alpha = new_alpha.clamp_min(1e-8); new_alpha /= new_alpha.sum()
+            new_alpha,new_m,new_g_ema=advance_alpha(self.alpha,self.m,self.g_ema,gradient,cfg)
             if not torch.isfinite(new_alpha).all():
                 raise ValueError('CRIC α: 更新后的权重不是有限值。')
         except Exception:
             backend._reaggregate_overall_from_alpha(old_alpha)
             raise
 
-        self.alpha, self.m = new_alpha, new_m
-        if cfg.g_ema_gamma > 0:
-            self.g_ema = new_g_ema
+        self.alpha, self.m, self.g_ema = new_alpha, new_m, new_g_ema
         for index, name in enumerate(self.keys):
             backend.importance_score_criteria[name] = float(self.alpha[index])
         backend._reaggregate_overall_from_alpha(self.alpha)
         self._eval_cursor += count
         self._last_update_step = context['step']
         self.update_count += 1
+        self.last_eval_stats=commit_alpha_selection(inputs,selected)
         return True

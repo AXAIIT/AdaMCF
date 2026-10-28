@@ -26,10 +26,10 @@ from transformers import AutoTokenizer, PhiForCausalLM
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
 from only_train_once import OTO
-from phi2_data import PreparedDataset, collate_examples, file_sha256, load_manifest, to_device
+from phi2_data import PreparedDataset, collate_examples, collate_alpha_examples, file_sha256, load_manifest, to_device
 from only_train_once.model_adapters.phi import group_summary, parameter_count
 from phi2_precision import audit_structure_precision
-from phi2_alpha import AlphaBatchStream, collate_alpha_examples
+from only_train_once.optimizer.alpha_data import AlphaEvaluationPool
 
 
 @dataclass
@@ -139,7 +139,7 @@ def phase_name(optimizer):
 def train_cric(model, optimizer, train_loader, alpha_loader, config, output, device):
     """全梯度 CRIC；post_pruning 是本次联合训练的尾段，不是 LoRA 恢复。"""
     # alpha 与 train/eval 是互斥的原始行索引，预处理清单已经核对。
-    alpha_stream = AlphaBatchStream(alpha_loader, device)
+    alpha_pool = AlphaEvaluationPool(alpha_loader)
     maximum_steps = (optimizer.start_global_sampling_step
                      + config.sampling_steps * config.max_cycle_period
                      + config.hybrid_training_steps + config.post_pruning_steps + 2)
@@ -165,14 +165,12 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
             updated = False
             alpha_ids, alpha_tokens, alpha_batch_count = [], 0, 0
             if optimizer.will_update_alpha_on_next_step():
-                alpha_batches, sampled_ids = alpha_stream.draw(optimizer)
-                updated = optimizer.alpha_scheduler.update(model, None, alpha_batches)
+                updated = optimizer.alpha_scheduler.update(model, None, alpha_pool)
                 if updated:
-                    alpha_ids = sampled_ids
-                    alpha_stream.commit(alpha_ids)
-                    alpha_batch_count = len(alpha_batches)
-                    alpha_tokens = sum(int((b['labels'][:,1:] != -100).sum()) for b,_ in alpha_batches)
-                del alpha_batches  # 本次更新结束即释放显存中的 α 微批。
+                    stats=optimizer.alpha_scheduler.last_eval_stats
+                    alpha_ids=stats['sample_ids']
+                    alpha_batch_count=stats['microbatches']
+                    alpha_tokens=stats['supervised_tokens']
             optimizer.step(loss=loss.detach())
             record = {'step': optimizer.num_steps, 'phase': phase_name(optimizer),
                       'loss': float(loss.detach()), 'gradient_norm_before_clip': float(norm),
@@ -181,7 +179,7 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
                       'alpha_updated': updated,
                       'alpha_row_ids':alpha_ids,'alpha_microbatches':alpha_batch_count,
                       'alpha_supervised_tokens':alpha_tokens,
-                      'alpha_unique_samples_seen':len(alpha_stream.used_row_ids),
+                      'alpha_unique_samples_seen':len(alpha_pool.used_sample_ids),
                       'learning_rate':optimizer.param_groups[0]['lr'],
                       'pruned_logical_groups':sum(len(g.get('pruned_idxes',[])) for g in optimizer.param_groups if g['is_prunable']),
                       'elapsed_seconds': time.perf_counter() - started}

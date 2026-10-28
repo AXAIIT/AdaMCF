@@ -19,7 +19,8 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from test_phi2_contract import tiny_model
-from phi2_alpha import AlphaBatchStream, collate_alpha_examples
+from phi2_data import collate_alpha_examples
+from only_train_once.optimizer.alpha_data import AlphaBatch
 from finetune_phi2_lora import RecoveryConfig, attach_lora, load_recovery, run_recovery, validate_config
 from phi2_data import file_sha256
 from prepare_phi2_data import prepare
@@ -40,20 +41,13 @@ def alpha_loader(seed=87):
 
 
 class PhiTrainingTests(unittest.TestCase):
-    def test_alpha_stream_covers_pool_is_reproducible_and_does_not_touch_global_rng(self):
-        fake=SimpleNamespace(alpha_scheduler=SimpleNamespace(cfg=SimpleNamespace(
-            eval_batch_limit=1,start_after_period=0,eval_batch_grow_every=2)),
-            alpha_update_context=lambda:{'round':0})
-        rng=torch.get_rng_state().clone()
-        first=AlphaBatchStream(alpha_loader(),torch.device('cpu'))
-        order=[first.draw(fake)[1][0] for _ in range(6)]
-        second=AlphaBatchStream(alpha_loader(),torch.device('cpu'))
-        self.assertEqual(order,[second.draw(fake)[1][0] for _ in range(6)])
-        self.assertEqual(set(order),set(range(6)))
-        self.assertNotEqual(order,list(range(6)))
-        self.assertTrue(torch.equal(torch.get_rng_state(),rng))
-        self.assertEqual(len(first.used_row_ids),0)
-        self.assertEqual(first.commit(order),6)
+    def test_alpha_collator_only_provides_causal_lm_data_and_metadata(self):
+        item=next(iter(alpha_loader()))
+        self.assertIsInstance(item,AlphaBatch)
+        self.assertIsNone(item.targets)
+        self.assertEqual(len(item.sample_ids),1)
+        self.assertEqual(item.supervised_tokens,1)
+        self.assertEqual(item.inputs['input_ids'].shape,(1,2))
 
     def test_real_cric_trace_records_alpha_row_ids_and_supervised_tokens(self):
         model=tiny_model();owner=OTO(model,pruning_mode='ffn')

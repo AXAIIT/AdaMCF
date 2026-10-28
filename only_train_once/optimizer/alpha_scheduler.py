@@ -3,8 +3,43 @@ import torch
 from dataclasses import dataclass, replace
 from typing import Optional, List, Tuple
 from torch.utils.data import DataLoader, Subset
+from .alpha_data import select_alpha_batches, commit_alpha_selection
 
 Tensor = torch.Tensor
+
+
+def alpha_boundary_confident(scores, budget, threshold):
+    """共用 HESSO 的边界置信门限，包括样本标准差的定义。"""
+    if not 1 <= budget < scores.numel():return False
+    ordered=scores.sort().values
+    margin=(ordered[budget]-ordered[budget-1]).abs()
+    return bool(margin/scores.std().clamp_min(1e-8)>threshold)
+
+
+def advance_alpha(alpha, momentum, gradient_ema, gradient, config):
+    """纯数值内核：保持既有 HESSO 的运算顺序，返回新状态，不原地提交。
+
+    CRIC 和 HESSO 的差分梯度均交给此处处理，避免 EMA、动量、信赖域
+    与单纯形归一化在两份实现中逐渐漂移。算法阶段调度仍由各优化器负责。
+    """
+    new_ema=gradient_ema
+    if config.g_ema_gamma>0:
+        new_ema=config.g_ema_gamma*gradient_ema+(1-config.g_ema_gamma)*gradient
+        effective=new_ema
+    else:effective=gradient
+    new_m=config.momentum*momentum+(1-config.momentum)*effective if config.momentum>0 else effective
+    proposal=alpha-config.lr*new_m
+    proposal=torch.clamp(proposal,min=1e-8);proposal=proposal/proposal.sum()
+    if config.max_step_l1 is not None and config.max_step_l1>0:
+        delta=proposal-alpha;l1=delta.abs().sum()
+        if l1>config.max_step_l1:delta=delta*(config.max_step_l1/(l1+1e-12))
+        proposal=alpha+delta
+        proposal=torch.clamp(proposal,min=1e-8);proposal=proposal/proposal.sum()
+    if config.ema_gamma>0:
+        new_alpha=(1-config.ema_gamma)*alpha+config.ema_gamma*proposal
+        new_alpha=torch.clamp(new_alpha,min=1e-8);new_alpha=new_alpha/new_alpha.sum()
+    else:new_alpha=proposal
+    return new_alpha,new_m,new_ema
 
 # 使用 dataclass 来定义 Alpha 调度器的配置项
 @dataclass
@@ -98,6 +133,7 @@ class LossGuidedAlphaScheduler:
         self.g_ema = torch.zeros_like(self.alpha)  # 差分梯度的 EMA
 
         self.backend = None  # 后端接口（由 HESSO 提供）
+        self.last_eval_stats = None
 
         if cfg is None:
             self.cfg = replace(ALPHA_CFG)
@@ -133,13 +169,14 @@ class LossGuidedAlphaScheduler:
         self.g_ema = torch.as_tensor(sd.get("g_ema", torch.zeros_like(self.alpha)), dtype=torch.float32, device=self.device)
 
     @torch.no_grad()
-    def update(self, model, criterion, inputs, targets, t_in_period=0):
+    def update(self, model, criterion, inputs, targets=None, t_in_period=0):
         """
         使用中心有限差分法更新 α 权重。
         inputs/targets 支持单个张量或微批列表。
         """
         assert self.backend is not None, "AlphaScheduler: backend is not attached."
         cfg = self.cfg
+        self.last_eval_stats = None
 
         is_warmup = self.backend.num_steps < self.backend.start_pruning_step
 
@@ -159,12 +196,8 @@ class LossGuidedAlphaScheduler:
         s = torch.cat(self.backend.global_scores, dim=0).detach()
         k_new = self.backend.active_num_redundant_groups[self.backend.curr_pruning_period]
         k_all = len(self.backend.pruned_group_idxes) + k_new
-        if 1 <= k_all < s.numel():
-            s_sorted, _ = torch.sort(s)
-            margin = (s_sorted[k_all] - s_sorted[k_all - 1]).abs()
-            sigma = s.std().clamp_min(1e-8)
-            if (margin / sigma) > cfg.min_gap_std:
-                return
+        if alpha_boundary_confident(s,k_all,cfg.min_gap_std):
+            return
 
         # 设置评估阶段的 drop ratio
         # T = max(1, int(self.backend.pruning_period_duration))
@@ -177,21 +210,9 @@ class LossGuidedAlphaScheduler:
         else:
             ratio_eval = cfg.eval_drop_ratio
 
-        # 选择评估用的微批（动态增长 batchsize）
-        if isinstance(inputs, (list, tuple)):
-            grow_k = max(0, cur_p - cfg.start_after_period) // max(1, cfg.eval_batch_grow_every)
-            want = min(cfg.eval_batch_limit, 1 + grow_k)
-            N = len(inputs)
-            use_n = min(N, max(1, want))
-
-            if not hasattr(self, "_eval_cursor"):
-                self._eval_cursor = 0
-            start = self._eval_cursor % N
-            idxs = [(start + i) % N for i in range(use_n)]
-            eval_batches = [inputs[i] for i in idxs]
-            self._eval_cursor += use_n
-        else:
-            eval_batches = [(inputs, targets)]
+        selected=select_alpha_batches(inputs,targets,cur_p,cfg,self.device,getattr(self,'_eval_cursor',0))
+        eval_batches=[(batch.inputs,batch.targets) for batch in selected]
+        self._eval_cursor=getattr(self,'_eval_cursor',0)+len(selected)
 
         def eval_with_alpha(a_vec: Tensor) -> Tensor:
             self.backend._reaggregate_overall_from_alpha(a_vec)
@@ -213,7 +234,8 @@ class LossGuidedAlphaScheduler:
 
                 # 定义一个内部辅助函数来处理 loss 返回值可能是 tuple 的情况
                 def get_loss_value(output, target):
-                    ret = criterion(output, target)
+                    # 通用模型返回 loss 时可不传 criterion；旧损失回调保持原调用。
+                    ret = (output.get('loss') if isinstance(output,dict) else output.loss) if criterion is None else criterion(output, target)
                     if isinstance(ret, (tuple, list)):
                         return ret[0]  # YOLO ComputeLoss 返回 (loss, items)
                     return ret
@@ -274,41 +296,13 @@ class LossGuidedAlphaScheduler:
             Lm = eval_with_alpha(a_minus)
             g[k] = (Lp - Lm) / (2.0 * cfg.eps)
 
-        # 梯度 EMA 平滑
-        if cfg.g_ema_gamma > 0:
-            self.g_ema = cfg.g_ema_gamma * self.g_ema + (1 - cfg.g_ema_gamma) * g
-            g_eff = self.g_ema
-        else:
-            g_eff = g
-
-        # 动量 + SGD 更新
-        self.m = cfg.momentum * self.m + (1 - cfg.momentum) * g_eff if cfg.momentum > 0 else g_eff
-        raw_new = self.alpha - cfg.lr * self.m
-        raw_new = torch.clamp(raw_new, min=1e-8)
-        raw_new = raw_new / raw_new.sum()
-
-        # 信赖域裁剪（L1）
-        if cfg.max_step_l1 is not None and cfg.max_step_l1 > 0:
-            delta = raw_new - self.alpha
-            l1 = delta.abs().sum()
-            if l1 > cfg.max_step_l1:
-                delta = delta * (cfg.max_step_l1 / (l1 + 1e-12))
-            raw_new = self.alpha + delta
-            raw_new = torch.clamp(raw_new, min=1e-8)
-            raw_new = raw_new / raw_new.sum()
-
-        # α EMA 平滑
-        if cfg.ema_gamma > 0:
-            self.alpha = (1 - cfg.ema_gamma) * self.alpha + cfg.ema_gamma * raw_new
-            self.alpha = torch.clamp(self.alpha, min=1e-8)
-            self.alpha = self.alpha / self.alpha.sum()
-        else:
-            self.alpha = raw_new
+        self.alpha,self.m,self.g_ema=advance_alpha(self.alpha,self.m,self.g_ema,g,cfg)
 
         # 更新后端的权重和聚合
         for i, k in enumerate(self.keys):
             self.backend.importance_score_criteria[k] = float(self.alpha[i].item())
         self.backend._reaggregate_overall_from_alpha(self.alpha)
+        self.last_eval_stats=commit_alpha_selection(inputs,selected)
 
 
 # === 下面是给外部脚本使用的工具函数 ===

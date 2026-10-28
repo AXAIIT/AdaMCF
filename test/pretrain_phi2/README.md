@@ -228,7 +228,8 @@ $P finetune_phi2_lora.py --base-dir runs/my_phi2_run/compressed_model \
 梯度累积按真实监督 token 加权，日志保存损失、token 数、学习率、梯度范数与内部 NLL。
 逐参数 SHA256 检查确认训练期间基座不变；只允许 A/B 出现梯度和更新。
 
-α 池由独立种子 alpha_seed 打乱并持续遍历，不再长期缓存最前面的批次。仍保持 CRIC 原周期边界、渐增微批规则和最终 α 重融合。
+α loader 由独立种子 alpha_seed 打乱；取批、渐增数量、评估内复用、成功覆盖计数由 optimizer/alpha_data.py 与两个公共 α 调度器统一负责。Phi 只提供 DataLoader 和 AlphaBatch 数据/行号适配，不再有独立 phi2_alpha.py 策略。
+HESSO 与 CRIC 共用 advance_alpha 数值内核和边界置信统计；两者各自的预算/时间轴与 CRIC 最终历史重融合保持原流程。旧 HESSO 固定缓存列表调用继续可用，也可传入通用 AlphaEvaluationPool；数据源类型和配置相同才保证取样一致。
 一次 α 差分更新内所有扰动复用同一批样本；training_trace.jsonl 记录实际行号、微批、监督 token 与累计独立覆盖量。gap 等条件跳过的更新不计入覆盖。
 
 产物：`compressed_model/` 是阶段一基座，`lora_recovery/adapter/` 保存 A/B，`recovery_manifest.json` 绑定基座和 adapter 摘要；
@@ -244,3 +245,10 @@ model = load_recovery("runs/my_two_stage/lora_recovery", device="cpu")
 
 workflow_result.json 记录两阶段结果；单独剪枝成功不再使等待恢复的总体任务标记为完成。阶段二失败时保留阶段一结果及独立失败日志。
 本次仅在小型 Phi 上完成四类剪枝模式、三格式和真实 LoRA 的 CPU 回归；未启动真实 Phi-2 正式恢复或七任务评测。
+
+## 正式实验的数据一致性
+
+Alpaca-only 仍只用于功能验证，不能称为论文实验数据已对齐。公开证据链为 HESSO-CRIC 参考 LoRAShear，后者列出了 OpenWebText、2022 Wikipedia、Gutenberg、BookCorpus，以及指令恢复用 Alpaca。
+当前未找到作者的 Phi-2 精确语料子集/混合比例/样本索引；四类预训练语料也未在当前共享数据清单中发现。WikiText 不能替代 2022 Wikipedia，BookCorpusOpen 不能静默替代 BookCorpus。
+corpus_alignment.json 明确记录已确认来源、当前文件摘要和待核实项，formal_alignment_complete=false；正式预处理/训练继续等待数据对齐，已有 proof 与任务 split 不改。
+详细公共策略与数据审查见 `docs/shared-alpha-and-corpus-alignment-20261028.md`。

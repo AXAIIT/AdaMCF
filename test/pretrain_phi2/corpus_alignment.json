@@ -1,0 +1,72 @@
+{
+  "status": "incomplete_author_phi2_sample_manifest_not_publicly_verified",
+  "formal_alignment_complete": false,
+  "current_alpaca_only_role": "functional_smoke_not_a_dataset_matched_paper_reproduction",
+  "reference_chain": [
+    {
+      "source": "https://arxiv.org/html/2409.09085v2#S4.SS6",
+      "direct_statement": "Phi-2 HESSO-CRIC experimental setup follows LoRAShear",
+      "scope_limit": "does not disclose exact Phi-2 corpus sample IDs, mixture, or source revisions"
+    },
+    {
+      "source": "https://arxiv.org/html/2310.18356v2#S4.SS1",
+      "direct_statement": "LoRAShear uses the four listed English pretraining corpora and Alpaca instruction data",
+      "scope_limit": "LoRAShear v2 reports LLaMAv1 experiments; the complete collection cannot be asserted as the exact Phi-2 sample set"
+    }
+  ],
+  "training_corpora": [
+    {
+      "name": "OpenWebText",
+      "reference_role": "LoRAShear pretraining collection; alternative to English CommonCrawl and C4",
+      "primary_source": "https://skylion007.github.io/OpenWebTextCorpus/",
+      "local_status": "not_found_in_current_shared_dataset_inventory",
+      "author_revision": null,
+      "author_sample_ids": null
+    },
+    {
+      "name": "Wikipedia English 2022 processed dump",
+      "reference_role": "LoRAShear pretraining collection",
+      "primary_source": "https://dumps.wikimedia.org/",
+      "local_status": "not_found; WikiText2 and WikiText103 are not this corpus",
+      "author_dump_date_and_processing_revision": null,
+      "author_sample_ids": null
+    },
+    {
+      "name": "Standardized Project Gutenberg Corpus",
+      "reference_role": "LoRAShear pretraining collection; Gerlach and Font-Clos 2020",
+      "primary_source": "https://zenodo.org/records/2422561",
+      "local_status": "not_found_in_current_shared_dataset_inventory",
+      "author_archive_revision": null,
+      "author_sample_ids": null
+    },
+    {
+      "name": "BookCorpus",
+      "reference_role": "LoRAShear pretraining collection; Zhu et al. 2015",
+      "primary_source": "https://huggingface.co/datasets/bookcorpus/bookcorpus",
+      "local_status": "not_found_in_current_shared_dataset_inventory",
+      "author_archive_revision": null,
+      "author_sample_ids": null,
+      "substitution_policy": "do not silently replace with BookCorpusOpen or another book corpus"
+    },
+    {
+      "name": "Stanford Alpaca",
+      "reference_role": "LoRAShear instruction-tuning corpus",
+      "primary_source": "https://github.com/tatsu-lab/stanford_alpaca/blob/761dc5bfbdeeffa89b8bff5d038781a4055f796a/alpaca_data.json",
+      "local_path": "/adminGroup/datasets_source203/llm_pruning/alpaca/alpaca_data.json",
+      "local_sha256": "2eddafc6b977608d778aaab8dfc7e50e547b3af9826dfb9e909d9fc362e4a419",
+      "local_raw_rows": 52002,
+      "functional_empty_response_filter_rows": 28,
+      "author_exact_subset_and_filter": null
+    }
+  ],
+  "evaluation_corpora": ["BoolQ", "PIQA", "HellaSwag", "WinoGrande", "ARC-e", "ARC-c", "OpenBookQA"],
+  "reference_pretraining_filter": "LoRAShear describes cleaning irregular characters and keeping paragraphs with more than 64 tokens; exact tokenizer and cleaning implementation not disclosed",
+  "unknowns_required_for_exact_samples": [
+    "author Phi-2 corpus roles in pruning and recovery",
+    "source revisions and Wikipedia 2022 dump date",
+    "cleaning, deduplication and tokenizer revisions",
+    "source mixing ratios, sample counts and token budgets",
+    "sample IDs/content hashes, order and split assignments"
+  ],
+  "action_boundary": "Do not claim data alignment or launch formal dataset-matched experiments until missing evidence is resolved; existing smoke evidence and seven-task splits remain unchanged"
+}
