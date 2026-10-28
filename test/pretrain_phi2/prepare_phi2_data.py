@@ -20,7 +20,13 @@ def sha256_file(path):
 
 
 def encode_example(row, row_id, tokenizer, max_length):
-    """保留响应监督；prompt、padding 均不参与损失，不手工移动 labels。"""
+    """当前功能验证模板：仅监督响应，causal shift 由模型内部完成。
+
+    这不是论文已公布的默认配方。正式实验还需冻结长序列截断策略并
+    审计长度分布；空响应在新预处理中过滤，旧冻结数据及 SHA 不重写。
+    """
+    if not row['output'].strip():
+        raise ValueError(f'样本 {row_id} 的响应为空，不能把仅 EOS 的样本当作指令答案。')
     prompt = f"### Instruction:\n{row['instruction'].strip()}\n\n"
     if row['input'].strip():
         prompt += f"### Input:\n{row['input'].strip()}\n\n"
@@ -29,7 +35,8 @@ def encode_example(row, row_id, tokenizer, max_length):
     answer_ids = tokenizer.encode(row['output'].strip(), add_special_tokens=False)
     answer_ids.append(tokenizer.eos_token_id)
     # 分开编码使监督边界明确。长 prompt 保留尾部与 Response 标记，
-    # 至少为响应保留一半预算；截断的响应以 EOS 结束。
+    # 至少为响应保留一半预算；截断的响应以 EOS 结束。128-token proof
+    # 会损失长样本信息，不应把这一截断规则直接用于正式七任务实验。
     prompt_ids = prompt_ids[-min(len(prompt_ids), max_length // 2):]
     answer_ids = answer_ids[:max_length - len(prompt_ids)]
     answer_ids[-1] = tokenizer.eos_token_id
@@ -41,18 +48,25 @@ def encode_example(row, row_id, tokenizer, max_length):
 
 
 def prepare(args):
+    """Alpaca 无官方 train/alpha/eval 划分；这是固定种子的内部角色切分。
+
+    alpha 参与选组，eval 仅作响应 NLL 诊断；二者都不是论文七项任务。
+    官方评测集应保持完整原划分，不在本函数中再次随机拆分。
+    """
     if args.max_length < 8 or min(args.train_samples, args.alpha_samples, args.eval_samples) < 1:
         raise ValueError('长度至少为 8，三个划分的样本数必须为正。')
     if args.output.exists():
         raise FileExistsError(f'输出目录已存在，请复用它或指定新目录：{args.output}')
     raw = json.loads(args.source.read_text(encoding='utf-8'))
+    # 只对新输出过滤空响应，row_id 仍指向原始 JSON；不改原文件和旧冻结数据。
+    eligible = [i for i,row in enumerate(raw) if row['output'].strip()]
     total = args.train_samples + args.alpha_samples + args.eval_samples
-    if total > len(raw):
-        raise ValueError('请求的样本总数超过原数据集。')
+    if total > len(eligible):
+        raise ValueError('请求的样本总数超过过滤空响应后的可用数据。')
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     if tokenizer.eos_token_id is None:
         raise ValueError('分词器必须提供 EOS。')
-    order = list(range(len(raw)))
+    order = eligible.copy()
     random.Random(args.seed).shuffle(order)
     selected, offset = {}, 0
     for split, count in [('train', args.train_samples), ('alpha', args.alpha_samples), ('eval', args.eval_samples)]:
@@ -63,6 +77,9 @@ def prepare(args):
     manifest = {
         'format_version': 1, 'source': str(args.source),
         'source_sha256': sha256_file(args.source), 'raw_rows': len(raw),
+        'eligible_rows':len(eligible),'filtered_empty_response_rows':len(raw)-len(eligible),
+        'filtering':'remove_empty_response_before_seeded_sampling',
+        'purpose':'functional_proof_not_seven_task_evaluation',
         'model_dir': str(args.model_dir), 'seed': args.seed,
         'max_length': args.max_length, 'loss_on': 'response_and_eos',
         'prompt_truncation': 'left_keep_tail_up_to_half_length',
@@ -85,6 +102,13 @@ def prepare(args):
         }
     (args.output / 'manifest.json').write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    (args.output/'prepare.log').write_text(
+        'Phi-2 数据预处理（新输出；原数据未改）\n'
+        f'原始样本={len(raw)}，可用样本={len(eligible)}，空响应过滤={len(raw)-len(eligible)}\n'
+        f'随机种子={args.seed}，最大长度={args.max_length}，监督=response+EOS\n'
+        + '\n'.join(f'{split}: rows={info["rows"]}, supervised_tokens={info["supervised_tokens"]}, sha256={info["sha256"]}'
+                    for split,info in manifest['splits'].items())
+        + '\ntrain/alpha/eval 为内部角色划分，不是七项 benchmark 的官方划分。\n',encoding='utf-8')
     print(json.dumps({'output': str(args.output), 'counts': {k: len(v) for k, v in selected.items()}}, ensure_ascii=False))
 
 

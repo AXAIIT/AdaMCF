@@ -1,0 +1,132 @@
+{
+  "status": "reviewed_proposal_not_an_executable_evaluator",
+  "formal_experiments_started": false,
+  "runner_implemented": false,
+  "reference_harness_commit": "d6de81643928d653435c431bae19945d41d32520",
+  "num_fewshot_proposal": 0,
+  "fewshot_is_not_claimed_as_paper_exact_setting": true,
+  "apply_chat_template_proposal": false,
+  "backend_proposal": "pytorch_eager",
+  "dtype_proposal": "float32",
+  "pruning_and_recovery_data_roles": "Alpaca/other approved training corpus; never the seven evaluation splits",
+  "primary_average_proposal": "unweighted mean of seven task acc values; preserve acc_norm separately",
+  "stages_to_compare": [
+    "original_pretrained",
+    "physically_pruned_before_recovery",
+    "post_pruning_lora_recovered"
+  ],
+  "lora_recovery_implemented": false,
+  "lora_policy": "attach LoRA only after physical pruning; freeze base; train A/B without a pruning optimizer",
+  "training_data_issues": [
+    "128-token proof truncation must be replaced by a frozen formal recipe",
+    "alpha=2 with limit=1 is a smoke setup, not a reliable formal validation pool",
+    "new preprocessing filters empty responses; old manifests are unchanged",
+    "check benchmark contamination before formal runs"
+  ],
+  "freeze_before_execution": [
+    "training corpus and max_length",
+    "response/EOS truncation policy",
+    "alpha and model-selection holdouts",
+    "LoRA rank/alpha/target_modules/lr/epochs",
+    "primary acc vs acc_norm convention",
+    "actual parameter reduction ratios and seed repetitions",
+    "evaluator package dependencies and exact revision"
+  ],
+  "log_each_task": [
+    "source path/revision/hash",
+    "official split and evaluated row count",
+    "task YAML and preprocessing revisions",
+    "label and choice validation",
+    "tokenizer/weights/architecture hashes",
+    "dtype/backend/fewshot/chat-template settings",
+    "per-example choice log-likelihoods and predictions",
+    "acc and acc_norm if defined, stderr/CI, runtime and failed rows",
+    "checkpoint stage and task-local log/JSON/JSONL paths"
+  ],
+  "tasks": [
+    {
+      "task": "boolq",
+      "official_split": "validation",
+      "expected_rows": 3270,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/boolq/data/validation-00000-of-00001.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/super_glue/boolq/default.yaml",
+      "label_mapping_required": {
+        "answer": "int(answer): False=0, True=1"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": false
+    },
+    {
+      "task": "piqa",
+      "official_split": "validation",
+      "expected_rows": 1838,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/piqa/plain_text/validation/0000.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/piqa/piqa.yaml",
+      "label_mapping_required": {
+        "label": "integer 0/1"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": true
+    },
+    {
+      "task": "hellaswag",
+      "official_split": "validation",
+      "expected_rows": 10042,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/hellaswag/data/validation-00000-of-00001.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/hellaswag/hellaswag.yaml",
+      "label_mapping_required": {
+        "label": "int(label)"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": true
+    },
+    {
+      "task": "winogrande",
+      "official_split": "validation",
+      "expected_rows": 1267,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/winogrande/winogrande_xl/validation-00000-of-00001.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/winogrande/default.yaml",
+      "label_mapping_required": {
+        "answer": "answer 1/2 to index 0/1; preserve official suffix scoring"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": false
+    },
+    {
+      "task": "arc_easy",
+      "official_split": "test",
+      "expected_rows": 2376,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/ai2_arc/ARC-Easy/test-00000-of-00001.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/arc/arc_easy.yaml",
+      "label_mapping_required": {
+        "answerKey": "choices.label.index(answerKey); do not assume A/B/C/D only"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": true
+    },
+    {
+      "task": "arc_challenge",
+      "official_split": "test",
+      "expected_rows": 1172,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/ai2_arc/ARC-Challenge/test-00000-of-00001.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/arc/arc_challenge.yaml",
+      "label_mapping_required": {
+        "answerKey": "choices.label.index(answerKey)"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": true
+    },
+    {
+      "task": "openbookqa",
+      "official_split": "test",
+      "expected_rows": 500,
+      "local_file": "/adminGroup/datasets_source203/llm_pruning/openbookqa/main/test-00000-of-00001.parquet",
+      "reference_task_url": "https://github.com/EleutherAI/lm-evaluation-harness/blob/d6de81643928d653435c431bae19945d41d32520/lm_eval/tasks/openbookqa/openbookqa.yaml",
+      "label_mapping_required": {
+        "answerKey": "choices.label.index(answerKey.lstrip())"
+      },
+      "proposed_primary_metric": "acc",
+      "also_record_acc_norm": true
+    }
+  ]
+}

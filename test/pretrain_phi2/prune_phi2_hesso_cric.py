@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from functools import partial
 import gc
 import json
+import logging
+from datetime import datetime, timezone, timedelta
 import math
 import os
 from pathlib import Path
@@ -31,7 +33,9 @@ from phi2_precision import audit_structure_precision
 
 @dataclass
 class PruningConfig:
+    """默认值用于功能验收，不是论文完整训练配方或正式任务评测配置。"""
     pruning_mode: str = 'joint'
+    export_format: str = 'safetensors'
     seed: int = 42
     batch_size: int = 1
     learning_rate: float = 0.0001
@@ -50,6 +54,8 @@ class PruningConfig:
     log_every: int = 10
     equivalence_atol: float = 0.0002
     equivalence_rtol: float = 0.0002
+    onnx_atol: float = 0.001
+    onnx_rtol: float = 0.001
 
 
 def write_json(path, value):
@@ -57,6 +63,36 @@ def write_json(path, value):
     temp = path.with_name(path.name + '.tmp')
     temp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
     temp.replace(path)
+
+
+def run_logger(output):
+    """终端和 UTF-8 run.log 同步输出；重复导出追加日志，拒绝覆盖仍在上层检查。"""
+    output = Path(output)
+    logger = logging.getLogger('adamcf.phi2')
+    target = str(output.resolve())
+    if getattr(logger, '_run_directory', None) != target:
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+        class ShanghaiFormatter(logging.Formatter):
+            def formatTime(self, record, datefmt=None):
+                return datetime.fromtimestamp(record.created, timezone(timedelta(hours=8))).isoformat(timespec='seconds')
+        formatter = ShanghaiFormatter('%(asctime)s | %(levelname)s | %(message)s')
+        for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(output/'run.log',encoding='utf-8')):
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger._run_directory = target
+    return logger
+
+
+def log_stage(output, stage, message, **fields):
+    """人类可读的阶段说明与 JSONL 事件共用字段，避免日志和结果口径不同。"""
+    timestamp = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec='seconds')
+    run_logger(output).info('[%s] %s | %s',stage,message,json.dumps(fields,ensure_ascii=False))
+    with (Path(output)/'events.jsonl').open('a',encoding='utf-8') as stream:
+        stream.write(json.dumps({'time':timestamp,'stage':stage,'message':message,**fields},ensure_ascii=False)+'\n')
 
 
 def memory_stats(device):
@@ -98,6 +134,7 @@ def phase_name(optimizer):
 
 
 def train_cric(model, optimizer, train_loader, alpha_loader, config, output, device):
+    """全梯度 CRIC；post_pruning 是本次联合训练的尾段，不是 LoRA 恢复。"""
     # alpha 与 train/eval 是互斥的原始行索引，预处理清单已经核对。
     alpha_batches = []
     for batch in alpha_loader:
@@ -109,6 +146,7 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
                      + config.hybrid_training_steps + config.post_pruning_steps + 2)
     iterator = iter(train_loader)
     started = time.perf_counter()
+    previous_phase = None
     with (output / 'training_trace.jsonl').open('w', encoding='utf-8', buffering=1) as trace:
         for _ in range(maximum_steps):
             try:
@@ -134,12 +172,15 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
                       'cric_cycle': optimizer.curr_cycle_period,
                       'alpha': optimizer.alpha_scheduler.alpha.detach().cpu().tolist(),
                       'alpha_updated': updated,
+                      'learning_rate':optimizer.param_groups[0]['lr'],
+                      'pruned_logical_groups':sum(len(g.get('pruned_idxes',[])) for g in optimizer.param_groups if g['is_prunable']),
                       'elapsed_seconds': time.perf_counter() - started}
             trace.write(json.dumps(record) + '\n')
-            if optimizer.num_steps == 1 or optimizer.num_steps % config.log_every == 0 or updated:
+            if optimizer.num_steps == 1 or optimizer.num_steps % config.log_every == 0 or updated or record['phase'] != previous_phase:
                 record.update(memory_stats(device))
                 write_json(output / 'status.json', {'state': 'running', **record})
-                print(json.dumps(record), flush=True)
+                log_stage(output,'训练','CRIC 进度；α 仅在周期边界更新。',**record)
+            previous_phase = record['phase']
             if (optimizer.is_cric_terminated and optimizer.num_steps >=
                     optimizer.cric_terminated_step + config.hybrid_training_steps + config.post_pruning_steps):
                 return record
@@ -147,7 +188,12 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
 
 
 def run(args):
+    """读取冻结数据后联合训练剪枝；本入口不安装 LoRA，也不执行七任务评测。"""
     config = PruningConfig(**json.loads(args.config.read_text(encoding='utf-8')))
+    if getattr(args,'export_format',None) is not None:
+        config.export_format=args.export_format
+    if config.export_format not in ('pt','torch','onnx','safetensors'):
+        raise ValueError('导出格式必须为 pt/torch、onnx 或 safetensors。')
     if (config.batch_size < 1 or config.alpha_eval_batches < 1 or config.log_every < 1
             or config.post_pruning_steps < 1 or config.warmup_steps < 0):
         raise ValueError('批量、日志间隔和剪后步数必须为正，预热步数不能为负。')
@@ -155,6 +201,7 @@ def run(args):
         raise FileExistsError('输出目录已存在；请为新实验使用独立目录。')
     args.output.mkdir(parents=True)
     args.created_output = True
+    log_stage(args.output,'1/6 数据','读取已冻结的 Alpaca 功能数据；eval 表示内部响应 NLL，不是七项 benchmark。',config=asdict(config))
     device = torch.device(args.device)
     torch.set_num_threads(4)
     random.seed(config.seed)
@@ -167,6 +214,10 @@ def run(args):
         torch.backends.cudnn.allow_tf32 = False
         torch.cuda.reset_peak_memory_stats(device)
     manifest = load_manifest(args.data_dir)
+    log_stage(args.output,'1/6 数据','三个角色分别用于梯度更新、α 更新和独立 NLL。',
+              split_rows={k:manifest['splits'][k]['rows'] for k in ('train','alpha','eval')},
+              max_length=manifest['max_length'],loss_on=manifest['loss_on'],
+              alpha_microbatch_limit=config.alpha_eval_batches,data_manifest_sha256=file_sha256(args.data_dir/'manifest.json'))
     for name, expected_sha256 in manifest['tokenizer_files'].items():
         path = args.model_dir / name
         if not path.is_file() or file_sha256(path) != expected_sha256:
@@ -186,6 +237,10 @@ def run(args):
         attn_implementation='eager').to(device)
     model.config.use_cache = False
     model.config.pad_token_id = tokenizer.pad_token_id
+    log_stage(args.output,'2/6 模型','加载 FP32 原生模型，剪枝阶段不附加 LoRA。',
+              parameters=parameter_count(model),trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad),
+              lora_parameters=sum(p.numel() for n,p in model.named_parameters() if 'lora_' in n.lower()),
+              dtype=str(next(model.parameters()).dtype),autocast=False,tf32=False,export_format=config.export_format)
     inputs = {'model_dir': str(args.model_dir), 'data_dir': str(args.data_dir),
               'data_manifest_sha256': file_sha256(args.data_dir / 'manifest.json'),
               'weights': {p.name: file_sha256(p) for p in sorted(args.model_dir.glob('*.safetensors'))},
@@ -202,6 +257,7 @@ def run(args):
     write_json(args.output / 'inputs.json', inputs)
     before_count = parameter_count(model)
     baseline = evaluate_response_loss(model, loaders['eval'], device)
+    log_stage(args.output,'3/6 剪前诊断','仅报告冻结 Alpaca 子集的响应 NLL。',**baseline)
     oto = OTO(model=model, pruning_mode=config.pruning_mode)
     groups = oto.get_param_groups()
     write_json(args.output / 'parameter_groups.json', group_summary(groups))
@@ -215,11 +271,11 @@ def run(args):
         adaptive_alpha=config.adaptive_alpha,
         alpha_scheduler_cfg={'warmup_updates': 0, 'eval_batch_limit': config.alpha_eval_batches})
     optimizer.phi_pruning_mode = config.pruning_mode
-    print(json.dumps({'stage': 'loaded', 'parameters': before_count,
+    log_stage(args.output,'4/6 剪枝','开始完整 CRIC 流程，候选比例不等于参数减少比例。',**{'parameters': before_count,
                       'prunable_parameter_groups': len(optimizer.prunable_param_group_dict),
                       'logical_groups': optimizer.total_num_groups,
                       'projection_steps': optimizer.start_global_sampling_step - optimizer.start_cric_step,
-                      'baseline': baseline, **memory_stats(device)}), flush=True)
+                      'baseline': baseline, **memory_stats(device)})
     if args.profile_only:
         batch = to_device(next(iter(loaders['train'])), device)
         model.train()
@@ -259,6 +315,7 @@ def run(args):
             if mode != config.pruning_mode and counts[key] != 0:
                 raise AssertionError('指定模式误删了其他类型结构。')
     sparse_eval = evaluate_response_loss(model, loaders['eval'], device)
+    log_stage(args.output,'5/6 剪后诊断','结构尚未物理删除；这是全梯度稀疏模型的 NLL，不是 LoRA 恢复准确率。',**sparse_eval,**counts)
     probe = to_device(next(iter(loaders['eval'])), device)
     probe = {k: v[:1] for k, v in probe.items()}
     with torch.no_grad():
@@ -278,6 +335,8 @@ def run(args):
                 'sparse_logits': sparse_logits.cpu(), 'atol': config.equivalence_atol,
                 'rtol': config.equivalence_rtol}, args.output / 'sparse_probe.pt')
     context = {'full_benchmark_evaluated': False,
+              'lora_recovery_performed':False,'training_dtype':'float32','export_format':config.export_format,
+              'onnx_atol':config.onnx_atol,'onnx_rtol':config.onnx_rtol,
               'pruning_mode': config.pruning_mode,
               'parameters_before': before_count,
               'target_logical_group_sparsity': config.target_group_sparsity,
@@ -295,11 +354,16 @@ def run(args):
 
 
 
-def export_run(run, device):
+def export_run(run, device, export_format=None):
+    """从稀疏检查点调用统一导出；格式只改变保存/推理接口，不改变剪枝决策。"""
     run, device = Path(run), torch.device(device)
     if (run / 'compressed_model').exists():
         raise FileExistsError('压缩包已存在，拒绝覆盖。')
     context = json.loads((run / 'export_context.json').read_text(encoding='utf-8'))
+    selected_format=export_format or context.get('export_format','safetensors')
+    if selected_format not in ('pt','torch','onnx','safetensors'):
+        raise ValueError('导出格式必须为 pt/torch、onnx 或 safetensors。')
+    log_stage(run,'6/6 导出','加载既有稀疏检查点，不重复训练；执行结构审计后发布。',export_format=selected_format)
     plan = json.loads((run / 'pruning_plan.json').read_text(encoding='utf-8'))
     probe = torch.load(run / 'sparse_probe.pt', map_location='cpu', weights_only=True)
     batch = to_device(probe['batch'], device)
@@ -317,7 +381,7 @@ def export_run(run, device):
     staging = tempfile.TemporaryDirectory(prefix='.export-', dir=run)
     try:
         oto = OTO(model=compressed, pruning_mode=plan.get('pruning_mode', 'joint'))
-        oto.construct_subnet(out_dir=staging.name, ckpt_format='safetensors',
+        oto.construct_subnet(out_dir=staging.name, ckpt_format=selected_format,
                              save_full_group_sparse_model=False,
                              pruning_plan=plan, tokenizer=tokenizer)
         plan = oto.pruning_plan
@@ -332,9 +396,18 @@ def export_run(run, device):
     plan['parameters_after'] = after_count
     # 独立重载应对齐同一压缩结构的原生 FP32 参考；稀疏/压缩结构等价
     # 单独由更严格的 FP64 门槛确认，FP32 漂移完整保留为诊断结果。
+    dynamic_probes=[]
+    if selected_format == 'onnx':
+        # 独立进程验证不同 batch/长度，防止 ONNX 只有样例 shape 能运行。
+        for batch_size,length in ((1,7),(2,5)):
+            ids=batch['input_ids'][:1,:length].repeat(batch_size,1)
+            mask=torch.ones_like(ids)
+            if batch_size==2:mask[1,-1]=0
+            with torch.no_grad():logits=compressed(input_ids=ids,attention_mask=mask,use_cache=False).logits
+            dynamic_probes.append({'input_ids':ids.cpu(),'attention_mask':mask.cpu(),'logits':logits.cpu()})
     torch.save({'batch': probe['batch'], 'sparse_logits': probe['sparse_logits'],
                 'compressed_logits': compact_logits.cpu(), 'atol': probe['atol'],
-                'rtol': probe['rtol']}, run / 'equivalence_probe.pt')
+                'rtol': probe['rtol'],'onnx_dynamic_probes':dynamic_probes}, run / 'equivalence_probe.pt')
     del sparse, reloaded_sparse
     gc.collect()
     if device.type == 'cuda':
@@ -342,18 +415,27 @@ def export_run(run, device):
     package = run / 'compressed_model'
     (run / 'pruning_plan.json').write_text(json.dumps(plan, indent=2), encoding='utf-8')
     report = {**context, 'functional_pruning_passed': True,
+              'export_format':selected_format,
+              'onnx_atol':context.get('onnx_atol',1e-3),'onnx_rtol':context.get('onnx_rtol',1e-3),
               'parameters_after': after_count,
               'parameter_reduction_ratio': 1 - after_count / context['parameters_before'],
               'precision_audit': diagnostics,
               'sparse_compressed_logits_max_abs_error': diagnostics['native_fp32']['max_abs_error'],
-              'compressed_package': str(package),
-              'compressed_weights_sha256': file_sha256(package / 'model.safetensors')}
+              'compressed_package': str(package)}
+    architecture=json.loads((package/'architecture.json').read_text(encoding='utf-8'))
+    weights_file=architecture.get('weights_file','model.safetensors')
+    report.update(compressed_weights_file=weights_file,
+                  compressed_weights_sha256=file_sha256(package/weights_file),
+                  compressed_files_sha256={str(p.relative_to(package)):file_sha256(p) for p in sorted(package.rglob('*')) if p.is_file()})
     if device.type == 'cuda':
         report.update(peak_allocated_GiB=torch.cuda.max_memory_allocated(device) / 2**30,
                       peak_reserved_GiB=torch.cuda.max_memory_reserved(device) / 2**30)
     for name in ('pruning_result.json', 'status.json'):
         (run / name).write_text(json.dumps({'state': 'completed', **report}, indent=2), encoding='utf-8')
-    print('PRUNING_COMPLETE', json.dumps(report), flush=True)
+    log_stage(run,'完成','结构审计与导出完成；正式任务准确率及 LoRA 恢复尚未执行。',
+              export_format=selected_format,parameters_after=after_count,
+              reduction=report['parameter_reduction_ratio'],structure_fp64=diagnostics['structure_fp64'],
+              native_fp32=diagnostics['native_fp32'],package=str(package))
 
 
 def main():
@@ -365,6 +447,8 @@ def main():
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--profile-only', action='store_true', help='只测全梯度、评分与缓存显存，不执行剪枝。')
     parser.add_argument('--export-only', action='store_true', help='仅从 --output 的已有稀疏检查点调用框架导出，无需重训。')
+    parser.add_argument('--export-format',choices=('pt','torch','onnx','safetensors'),default=None,
+                        help='压缩产物格式；覆盖配置，旧配置默认 safetensors。ONNX 仅供推理。')
     args = parser.parse_args()
     if args.export_only:
         if args.profile_only:
@@ -372,7 +456,12 @@ def main():
         torch.set_num_threads(4)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-        export_run(args.output, args.device)
+        try:
+            export_run(args.output, args.device, args.export_format)
+        except Exception:
+            if (args.output/'run.log').is_file() and not (args.output/'compressed_model').exists():
+                run_logger(args.output).exception('导出失败；稀疏检查点保留，可修正问题后重试。')
+            raise
         return
     if args.data_dir is None:
         parser.error('训练模式需要 --data-dir；已有稀疏检查点可使用 --export-only。')
@@ -381,6 +470,7 @@ def main():
     except Exception as error:
         if getattr(args, 'created_output', False):
             write_json(args.output / 'failure.json', {'state': 'failed', 'error': repr(error)})
+            run_logger(args.output).exception('运行失败，未把失败记录标记为成功。')
         raise
 
 

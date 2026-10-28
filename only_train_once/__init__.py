@@ -284,6 +284,9 @@ class OTO:
             save_full_group_sparse_model: 是否保存全组稀疏模型。
             ckpt_format: 检查点保存格式（如 torch、safetensors 等）。
         """
+        # pt 是原 torch 格式的显式别名；旧调用默认仍为 torch。
+        if ckpt_format == 'pt':
+            ckpt_format = 'torch'
         if self._model_adapter is not None:
             if self._mode != 'prune':
                 raise NotImplementedError('原生模型适配当前仅支持 prune。')

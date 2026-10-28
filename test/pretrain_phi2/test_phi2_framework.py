@@ -25,28 +25,40 @@ from only_train_once.operation.operator import COMPOSED_MODULES, PhiAttentionOTO
 class PhiFrameworkTests(unittest.TestCase):
     def test_export_only_cli_reuses_sparse_checkpoint_and_refuses_overwrite(self):
         from prune_phi2_hesso_cric import main
+        from verify_phi2_pruning import verify
         model, plan = zeroed_model_and_plan()
         tokens = torch.arange(8).reshape(1,-1)
         batch = {'input_ids':tokens, 'labels':tokens}
         with torch.no_grad():reference = model(**batch, use_cache=False).logits
-        with tempfile.TemporaryDirectory() as tmp:
-            run = Path(tmp)
-            model.save_pretrained(run/'sparse_model',safe_serialization=True)
-            (run/'pruning_plan.json').write_text(json.dumps(plan),encoding='utf-8')
-            (run/'export_context.json').write_text(json.dumps({
-                'parameters_before':sum(p.numel() for p in model.parameters())}),encoding='utf-8')
-            torch.save({'batch':batch,'sparse_logits':reference,'atol':1e-6,'rtol':1e-5},run/'sparse_probe.pt')
-            argv=['prune','--export-only','--output',str(run),'--device','cpu']
-            tokenizer=SimpleNamespace(save_pretrained=lambda _:None)
-            with patch('sys.argv',argv), patch('prune_phi2_hesso_cric.AutoTokenizer.from_pretrained',return_value=tokenizer):
-                with contextlib.redirect_stdout(io.StringIO()):main()
-            loaded = OTO.load_subnet(run/'compressed_model').eval()
-            probe = torch.load(run/'equivalence_probe.pt',weights_only=True)
-            with torch.no_grad():
-                torch.testing.assert_close(loaded(**batch,use_cache=False).logits,probe['compressed_logits'])
-            result = (run/'pruning_result.json').read_bytes()
-            with patch('sys.argv',argv), self.assertRaises(FileExistsError):main()
-            self.assertEqual((run/'pruning_result.json').read_bytes(),result)
+        for fmt in ('pt','safetensors','onnx'):
+            with self.subTest(format=fmt), tempfile.TemporaryDirectory() as tmp:
+                run = Path(tmp)
+                model.save_pretrained(run/'sparse_model',safe_serialization=True)
+                (run/'pruning_plan.json').write_text(json.dumps(plan),encoding='utf-8')
+                (run/'export_context.json').write_text(json.dumps({
+                    'parameters_before':sum(p.numel() for p in model.parameters())}),encoding='utf-8')
+                torch.save({'batch':batch,'sparse_logits':reference,'atol':1e-6,'rtol':1e-5},run/'sparse_probe.pt')
+                argv=['prune','--export-only','--output',str(run),'--device','cpu','--export-format',fmt]
+                tokenizer=SimpleNamespace(save_pretrained=lambda _:None)
+                with patch('sys.argv',argv), patch('prune_phi2_hesso_cric.AutoTokenizer.from_pretrained',return_value=tokenizer):
+                    with contextlib.redirect_stdout(io.StringIO()):main()
+                loaded = OTO.load_subnet(run/'compressed_model')
+                probe = torch.load(run/'equivalence_probe.pt',weights_only=True)
+                if fmt=='onnx':
+                    torch.testing.assert_close(torch.from_numpy(loaded(tokens)),probe['compressed_logits'],atol=1e-5,rtol=1e-4)
+                    verify(SimpleNamespace(run_dir=run,device='cpu'))
+                    self.assertTrue(json.loads((run/'independent_verification.json').read_text())['inference_only'])
+                else:
+                    loaded.eval()
+                    with torch.no_grad():
+                        torch.testing.assert_close(loaded(**batch,use_cache=False).logits,probe['compressed_logits'])
+                events=[json.loads(line) for line in (run/'events.jsonl').read_text().splitlines()]
+                self.assertTrue(any(e['stage']=='完成' for e in events))
+                self.assertTrue(all(e['time'].endswith('+08:00') for e in events))
+                self.assertIn('6/6 导出',(run/'run.log').read_text())
+                result = (run/'pruning_result.json').read_bytes()
+                with patch('sys.argv',argv), self.assertRaises(FileExistsError):main()
+                self.assertEqual((run/'pruning_result.json').read_bytes(),result)
 
     def test_training_cli_requires_dataset_without_creating_output(self):
         from prune_phi2_hesso_cric import main
@@ -55,6 +67,28 @@ class PhiFrameworkTests(unittest.TestCase):
             with patch('sys.argv',['prune','--output',str(output)]):
                 with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):main()
             self.assertFalse(output.exists())
+
+    def test_cric_loop_writes_readable_log_and_structured_step_trace(self):
+        from prune_phi2_hesso_cric import train_cric,PruningConfig
+        model=tiny_model();owner=OTO(model,pruning_mode='ffn')
+        with contextlib.redirect_stdout(io.StringIO()):
+            optimizer=owner.hessocric(lr=.001,first_momentum=0.,target_group_sparsity=.25,
+                start_cric_step=1,sampling_steps=2,max_cycle_period=2,hybrid_training_steps=3,
+                alpha_scheduler_cfg={'warmup_updates':0,'min_gap_std':1e9})
+        config=PruningConfig(warmup_steps=0,sampling_steps=2,max_cycle_period=2,
+                             hybrid_training_steps=3,post_pruning_steps=1,log_every=10)
+        tokens=torch.arange(8).reshape(1,-1);alpha=tokens+8
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                final=train_cric(model,optimizer,[{'input_ids':tokens,'labels':tokens}],
+                    [{'input_ids':alpha,'labels':alpha}],config,output,torch.device('cpu'))
+            trace=[json.loads(line) for line in (output/'training_trace.jsonl').read_text().splitlines()]
+            self.assertEqual(final['phase'],'post_pruning')
+            self.assertEqual(len(trace),final['step'])
+            self.assertTrue(all('learning_rate' in row and 'pruned_logical_groups' in row for row in trace))
+            self.assertIn('CRIC 进度',(output/'run.log').read_text())
+            self.assertTrue((output/'events.jsonl').is_file())
 
     def test_auto_dispatch_uses_native_adapter_without_onnx(self):
         with patch('only_train_once.Graph', side_effect=AssertionError('不应调用追踪器')):
@@ -149,11 +183,54 @@ class PhiFrameworkTests(unittest.TestCase):
         oto = OTO(model)
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp)/'compressed_model').mkdir()
-            for kwargs, error in [({},FileExistsError),({'ckpt_format':'onnx'},ValueError),
+            for kwargs, error in [({},FileExistsError),({'ckpt_format':'invalid'},ValueError),
                                   ({'merge_lora_to_base':True},ValueError)]:
                 with self.assertRaises(error):
                     oto.construct_subnet(out_dir=tmp, pruning_plan=plan, **kwargs)
         self.assertFalse(oto._model_adapter.exported)
+
+    def test_three_explicit_formats_export_load_and_preserve_dynamic_logits(self):
+        for mode in ('joint','head_dim'):
+            if mode == 'joint':
+                sparse,plan = zeroed_model_and_plan()
+            else:
+                sparse = tiny_model();owner = OTO(sparse,pruning_mode=mode)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    optimizer = owner.hessocric(lr=.01,sampling_steps=2,hybrid_training_steps=3,adaptive_alpha=False)
+                for group in optimizer.param_groups:
+                    if group['is_prunable']:
+                        group['pruned_idxes']=list(range(group['layer_index']+1))
+                        optimizer._scale_group(group,group['pruned_idxes'],0.)
+                optimizer.is_cric_terminated=True
+                plan=owner.collect_pruning_plan()
+            for fmt,name in [('pt','model.pt'),('safetensors','model.safetensors'),('onnx','model.onnx')]:
+                with self.subTest(mode=mode,format=fmt),tempfile.TemporaryDirectory() as tmp:
+                    compact=copy.deepcopy(sparse);oto=OTO(compact,pruning_mode=mode)
+                    oto.construct_subnet(out_dir=tmp,pruning_plan=plan,ckpt_format=fmt,save_full_group_sparse_model=False)
+                    package=Path(oto.compressed_model_path)
+                    self.assertTrue((package/name).is_file())
+                    for other in {'model.pt','model.safetensors','model.onnx'}-{name}:
+                        self.assertFalse((package/other).exists())
+                    loaded=OTO.load_subnet(package)
+                    for batch,length in ((1,3),(2,7),(1,11)):
+                        ids=torch.arange(batch*length).reshape(batch,length)%128
+                        mask=torch.ones_like(ids)
+                        if batch==2:mask[1,-2:]=0
+                        with torch.no_grad():reference=compact(ids,attention_mask=mask,use_cache=False).logits
+                        if fmt=='onnx':
+                            actual=torch.from_numpy(loaded(ids,mask))
+                        else:
+                            loaded.eval()
+                            with torch.no_grad():actual=loaded(ids,attention_mask=mask,use_cache=False).logits
+                        torch.testing.assert_close(actual,reference,atol=1e-5,rtol=1e-4)
+                    if fmt=='onnx':
+                        with self.assertRaisesRegex(RuntimeError,'推理格式'):loaded.train()
+
+    def test_lora_is_not_accepted_as_a_pruning_candidate(self):
+        model=tiny_model()
+        model.register_parameter('lora_A',nn.Parameter(torch.ones(2,32)))
+        with self.assertRaisesRegex(ValueError,'先剪枝'):
+            OTO(model)
 
     def test_optional_float16_package_preserves_dtype(self):
         model, plan = zeroed_model_and_plan()

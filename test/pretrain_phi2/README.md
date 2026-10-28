@@ -139,7 +139,7 @@ profile-only 加载真实模型与 CRIC 缓存，执行全梯度和五准则评�
 | sparse_model/ | 稀疏原尺寸检查点；保留试探结果，避免导出失败后重跑训练 |
 | sparse_probe.pt / equivalence_probe.pt | 固定输入、稀疏及压缩参考 logits，纯 Tensor 检查数据 |
 | precision_audit.json | 原生 FP32 误差、相对 L2 与 token top-1 一致率，严格 FP64 对照结果 |
-| compressed_model/ | model.safetensors、architecture.json、模型配置与分词器 |
+| compressed_model/ | 按格式保存 model.pt / model.safetensors / model.onnx（含外置权重），以及结构、配置和分词器 |
 | pruning_result.json | 实际压缩率、误差、显存、响应损失 |
 | independent_verification.json | 新进程输出对齐、缓存生成与反向传播结果 |
 
@@ -147,7 +147,7 @@ profile-only 加载真实模型与 CRIC 缓存，执行全梯度和五准则评�
 
 真实深层 Phi 的矩阵尺寸改变会改变 FP32 GEMM 求和顺序，原生 FP32 稀疏/压缩 logits 可能不满足逐元素 2e-4 门槛；该失败标志和实测误差保留，不改写为通过。为判别结构错误与浮点漂移，另外执行严格 FP64 对照，诊断作用域内将 attention softmax 也提升为 FP64，RoPE 使用双方相同的原生位置常数。作用域退出即恢复 FP32，安装包、训练和正常推理使用原生实现。独立重载检查仍使用原有 FP32 容差，对齐相同压缩结构的参考输出。
 
-逐层剪后宽度可以不同，原始全局 PhiConfig 无法单独重建这种结构。**通过 OTO.load_subnet() 加载压缩包**，不要直接用普通 AutoModelForCausalLM.from_pretrained() 加载本包。加载器用 meta 骨架和 JSON 清单重建，严格匹配 safetensors 键与形状，不反序列化任意 Python 模型对象。
+逐层剪后宽度可以不同，原始全局 PhiConfig 无法单独重建这种结构。**通过 OTO.load_subnet() 加载压缩包**，不要直接用普通 AutoModelForCausalLM.from_pretrained() 加载本包。加载器用 meta 骨架和 JSON 清单重建，严格匹配 pt/safetensors 的键与形状；ONNX 则加载为 CPU Runtime 推理接口，不反序列化任意 Python 模型对象。
 
 ## 指标边界与测试
 
@@ -179,8 +179,23 @@ compressed = OTO.load_subnet(oto.compressed_model_path, device="cuda:0")
 该入口会原地改变模型结构；导出后旧优化器的 Parameter 引用不能继续使用。
 原生 Phi 输出 `out_dir/compressed_model/`，默认同时保存 `out_dir/sparse_model/`。
 已有稀疏检查点可通过 `pruning_plan=plan` 导出，框架会先检查所有删除位置精确为零。
-原生模型始终保存 safetensors + config.json + architecture.json；默认 `ckpt_format="torch"`
-也使用该安全结构包。`export_huggingface_format=True` 不会改变其需由 `OTO.load_subnet`
-重建异构结构的要求；tokenizer 参数可选，实际语言模型部署应提供。
+原生压缩产物可用 `ckpt_format="pt"`、`"safetensors"`、`"onnx"` 显式选择；
+框架默认 `"torch"` 等同于 `"pt"`，不再隐式输出 safetensors。pt 和 safetensors
+保存可训练权重与结构 JSON；ONNX 为无 KV cache 的 logits 推理图，不能直接做 LoRA
+微调。ONNX 大权重文件必须随 .onnx 主文件一起复制。旧 safetensors 包继续支持加载。
 旧图模型的文件命名、torch/ONNX/HF 保存分支和旧算子注册保持原行为。
 详细兼容边界、回归测试和模块职责见 `docs/native-phi-adapter.md`。
+
+## 格式选择与日志
+
+训练模式：在现有命令中加入 `--export-format pt` / `onnx` / `safetensors`。
+仅导出：`$P prune_phi2_hesso_cric.py --export-only --output runs/EXISTING_SPARSE_RUN --export-format onnx`。
+每个输出目录只发布一种格式；已有 compressed_model 时拒绝覆盖。
+CLI 旧配置默认 safetensors，API 默认 torch/pt；日志与结果会记录实际格式。
+ONNX：`session = OTO.load_subnet(package, device="cpu")`，`logits = session(input_ids, attention_mask)`。
+其余两种格式返回 PyTorch 模型。格式与训练精度分开，当前全梯度剪枝固定 FP32，无 LoRA 恢复。
+
+终端与 run.log 同步输出阶段信息，events.jsonl 保存结构事件，training_trace.jsonl 保存每步记录。
+新数据预处理过滤空响应并保存 prepare.log；不会重写已有 proof_v1 数据。
+evaluation_protocol.json 是七任务评测的审查提案，不是已经可执行的评测器，也不代表任务实验已开始。
+正式实验前需冻结长度/截断、训练与 α 池、LoRA 配方、评测实现和指标口径；见框架 docs 的协议审查文档。

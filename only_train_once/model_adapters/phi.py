@@ -18,6 +18,9 @@ from ..transform import TensorTransform
 
 
 def validate_native_phi(model):
+    """剪枝阶段只接受原生基座；LoRA 应在结构固定后另行附加并训练。"""
+    if any('lora_' in name.lower() for name, _ in model.named_parameters()):
+        raise ValueError('当前原生 Phi 剪枝不接受 LoRA 参数；请先剪枝，再附加 LoRA 恢复精度。')
     config = model.config
     if config.model_type != 'phi' or config.num_attention_heads != config.num_key_value_heads:
         raise ValueError('此适配只支持原生 Phi MHA，不支持 GQA 或其他模型类型。')
@@ -195,16 +198,32 @@ def parameter_count(model):
     return sum(p.numel() for p in model.parameters())
 
 
-def save_pruned_package(model, tokenizer, plan, output):
-    """导出纯 safetensors + JSON；异构逐层宽度由本文件的 loader 重建。"""
+def save_pruned_package(model, tokenizer, plan, output, weights_format='safetensors'):
+    """保存显式选择的权重格式，逐层结构合同始终单独保存为 JSON。
+
+    torch/pt 保存纯 state_dict，不 pickle 整个 Python 模型；safetensors
+    同样需要结构 loader 重建。ONNX 保存无缓存 logits 图，仅用于推理。
+    """
+    weights_format = 'torch' if weights_format == 'pt' else weights_format
+    names = {'torch':'model.pt', 'safetensors':'model.safetensors', 'onnx':'model.onnx'}
+    if weights_format not in names:
+        raise ValueError('weights_format 必须为 pt/torch、safetensors 或 onnx。')
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     model.config.save_pretrained(output)
     if tokenizer is not None:
         tokenizer.save_pretrained(output)
-    (output / 'architecture.json').write_text(json.dumps(plan, indent=2), encoding='utf-8')
-    state = {name: tensor.detach().cpu().contiguous() for name, tensor in model.state_dict().items()}
-    save_file(state, str(output / 'model.safetensors'), metadata={'format': 'pt'})
+    package_plan = {**plan, 'weights_format':weights_format, 'weights_file':names[weights_format]}
+    (output / 'architecture.json').write_text(json.dumps(package_plan, indent=2), encoding='utf-8')
+    if weights_format == 'onnx':
+        from .phi_onnx import export_phi_onnx
+        export_phi_onnx(model, output/names[weights_format])
+    else:
+        state = {name: tensor.detach().cpu().contiguous() for name, tensor in model.state_dict().items()}
+        if weights_format == 'torch':
+            torch.save(state, output/names[weights_format])
+        else:
+            save_file(state, str(output/names[weights_format]), metadata={'format': 'pt'})
 
 
 def load_pruned_package(directory, device='cpu'):
@@ -212,11 +231,22 @@ def load_pruned_package(directory, device='cpu'):
     config = PhiConfig.from_pretrained(directory, local_files_only=True)
     config._attn_implementation = 'eager'
     plan = json.loads((directory / 'architecture.json').read_text(encoding='utf-8'))
+    # 旧版结构包没有格式字段，继续按原 safetensors 约定加载。
+    weights_format = plan.get('weights_format', 'safetensors')
+    expected_files = {'torch':'model.pt','safetensors':'model.safetensors','onnx':'model.onnx'}
+    if weights_format not in expected_files or plan.get('weights_file',expected_files[weights_format]) != expected_files[weights_format]:
+        raise ValueError('结构包权重格式或文件名非法。')
+    if weights_format == 'onnx':
+        from .phi_onnx import PhiONNXModel
+        return PhiONNXModel(directory, device)
     # 不反序列化任意 Python 对象，不先分配一份完整稠密模型。
     with torch.device('meta'):
         model = PhiForCausalLM(config)
     apply_structure(model, plan)
-    state = load_file(str(directory / 'model.safetensors'), device='cpu')
+    if weights_format == 'torch':
+        state = torch.load(directory/'model.pt', map_location='cpu', weights_only=True)
+    else:
+        state = load_file(str(directory / 'model.safetensors'), device='cpu')
     model.load_state_dict(state, strict=True, assign=True)
     # 非持久 RoPE buffer 不在 state_dict 中，meta 骨架需显式重建。
     from transformers.models.phi.modeling_phi import PhiRotaryEmbedding
@@ -280,8 +310,8 @@ class NativePhiAdapter:
                          merge_lora_to_base, unmerge_lora_to_base):
         if self.exported:
             raise RuntimeError('同一 OTO 不能重复进行物理剪枝。')
-        if ckpt_format not in ('torch', 'safetensors'):
-            raise ValueError('原生 Phi 当前导出安全结构包，ckpt_format 支持 torch/safetensors。')
+        if ckpt_format not in ('torch', 'pt', 'safetensors', 'onnx'):
+            raise ValueError('ckpt_format 支持 pt/torch、safetensors、onnx。')
         if merge_lora_to_base or unmerge_lora_to_base:
             raise ValueError('原生 Phi 适配不接受 LoRA 合并选项；旧图算子分支保持原行为。')
         plan = copy.deepcopy(pruning_plan) if pruning_plan is not None else self.collect_pruning_plan(optimizer)
@@ -300,5 +330,5 @@ class NativePhiAdapter:
         if export_float16:
             self.model.half()
         plan['parameters_after'] = parameter_count(self.model)
-        save_pruned_package(self.model, tokenizer, plan, package)
+        save_pruned_package(self.model, tokenizer, plan, package, weights_format=ckpt_format)
         return str(package), str(sparse_path) if save_full_group_sparse_model else None, plan

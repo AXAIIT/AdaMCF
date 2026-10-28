@@ -49,6 +49,26 @@ def zeroed_model_and_plan():
 
 
 class PhiStructureTests(unittest.TestCase):
+    def test_preparation_filters_empty_responses_without_rewriting_raw_data(self):
+        class Tokenizer:
+            eos_token_id=127
+            def encode(self,text,add_special_tokens=False):return [ord(c)%100 for c in text]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp=Path(tmp);source=tmp/'source.json'
+            source.write_text(json.dumps([{'instruction':'empty','input':'','output':'  '}]
+                +[{'instruction':str(i),'input':'','output':'answer'} for i in range(6)]),encoding='utf-8')
+            before=source.read_bytes()
+            args=SimpleNamespace(source=source,model_dir=tmp,output=tmp/'prepared',seed=42,
+                                 max_length=32,train_samples=2,alpha_samples=2,eval_samples=2)
+            with patch('prepare_phi2_data.AutoTokenizer.from_pretrained',return_value=Tokenizer()):
+                with contextlib.redirect_stdout(io.StringIO()):prepare(args)
+            manifest=load_manifest(args.output)
+            self.assertEqual(manifest['filtered_empty_response_rows'],1)
+            self.assertEqual(manifest['eligible_rows'],6)
+            self.assertEqual(source.read_bytes(),before)
+            self.assertFalse(any(0 in x['row_ids'] for x in manifest['splits'].values()))
+            self.assertTrue((args.output/'prepare.log').is_file())
+
     def test_modes_have_exclusive_candidates_with_complete_parameter_ownership(self):
         for mode, expected in [('ffn', 'ffn'), ('num_head', 'attention'), ('head_dim', 'head_dim')]:
             with self.subTest(mode=mode):
@@ -154,6 +174,10 @@ class PhiStructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             package = Path(tmp) / 'old_package'
             save_pruned_package(model, SimpleNamespace(save_pretrained=lambda _:None), old, package)
+            # 旧运行包没有序列化字段，验证 loader 的真实向后兼容路径。
+            architecture=json.loads((package/'architecture.json').read_text())
+            architecture.pop('weights_format',None);architecture.pop('weights_file',None)
+            (package/'architecture.json').write_text(json.dumps(architecture),encoding='utf-8')
             restored = load_pruned_package(package).eval()
         with torch.no_grad():
             torch.testing.assert_close(restored(tokens, use_cache=False).logits,

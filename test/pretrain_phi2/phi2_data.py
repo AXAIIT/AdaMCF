@@ -16,6 +16,7 @@ def file_sha256(path):
 
 
 def load_manifest(directory):
+    """核对索引互斥和文件摘要；不把内部 eval 误当作最终任务测试集。"""
     directory = Path(directory)
     manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
     if manifest.get('format_version') != 1:
@@ -55,6 +56,11 @@ class PreparedDataset(Dataset):
 
 
 def collate_examples(rows, pad_token_id):
+    """EOS 可兼作 padding ID，但 padding 的 attention=0、label=-100。
+
+    mask 由真实长度构造，不能简单按 token_id==EOS 屏蔽，否则会误删
+    真实响应末尾 EOS 的训练信号。input_ids 与 labels 保持未位移对齐。
+    """
     length = max(len(row['input_ids']) for row in rows)
     ids = torch.full((len(rows), length), pad_token_id, dtype=torch.long)
     labels = torch.full_like(ids, -100)

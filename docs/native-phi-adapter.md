@@ -8,7 +8,7 @@ Graph/ONNX 路径。其他模型默认仍进入原图路径。匹配不使用模
 把原生 `PhiAttention` 注册成旧 `PhiMHA`，因此旧算子的属性和分组语义保持独立。
 框架导入和非 Phi 使用不要求安装 Transformers；原生分支延迟导入依赖。
 
-原生分支使用显式模型结构合同，不执行 ONNX 追踪。输入分词、数据集、训练循环
+原生分支的依赖发现使用显式模型结构合同，不执行 ONNX 追踪；选择 ONNX 输出时才对固定子网执行导出追踪。输入分词、数据集、训练循环
 和精度审计仍由实验代码负责。这一适配经过 Transformers 4.53.0、PyTorch
 2.7.1+cu128 验证，不意味着自动支持其他 Transformers 版本或任意 Phi 变体。
 
@@ -53,11 +53,23 @@ full_group_sparse_model_dir 指定这两个子目录各自的父目录。默认�
 层的索引和删除位置精确归零，检查失败不会开始物理裁剪。无显式 plan 时仅支持
 从已完成的 HESSOCRIC 自动冻结合同，并核对优化器的参数归属。
 
-原生输出为 model.safetensors、config.json、architecture.json，以及可选 tokenizer。
-默认 ckpt_format="torch" 和显式 "safetensors" 都保存该安全结构包，避免依赖 Python
-对象反序列化；HF 保存标志不替代结构 loader。普通 AutoModel.from_pretrained
-不会解释 architecture.json 中的逐层异构宽度，必须用 OTO.load_subnet。
-原图分支的 torch/ONNX/HF 文件格式、路径命名和调用参数保持原行为。
+原生格式显式选择：
+
+| ckpt_format | 压缩产物 | 加载与用途 |
+| --- | --- | --- |
+| torch / pt（框架默认） | model.pt + config.json + architecture.json | 纯 state_dict；OTO.load_subnet 重建可训练模型 |
+| safetensors | model.safetensors + config.json + architecture.json | OTO.load_subnet 重建可训练模型 |
+| onnx | model.onnx + 必需的外置权重 + config.json + architecture.json | OTO.load_subnet(device="cpu") 返回 ONNX Runtime 推理接口 |
+
+.pt 使用 weights_only=True 加载，不 pickle 整个模型对象。旧版未声明格式的
+safetensors 结构包继续兼容。tokenizer 可随包保存。ONNX 支持动态 batch/sequence、
+input_ids 与 attention_mask 输入和 logits 输出，不提供 KV cache、反向传播或 LoRA 微调。
+超过 protobuf 2GB 限制时必须一并保存外置权重文件，不可只复制 .onnx 主文件。
+当前 ONNX 加载器禁用 ORT 图融合并开启确定性计算；默认高级融合曾在真实 Phi-2
+上超过预设数值门槛，失败记录保留。它是数值验证基线，不宣称推理速度最优。
+权重文件格式不决定 FP32/FP16；当前训练使用 FP32，序列化格式分别选择。
+普通 AutoModel.from_pretrained 不会解释逐层异构结构清单，训练格式仍需 OTO.load_subnet。
+原图分支的 torch/ONNX/HF 行为保持不变，pt 是 torch 的额外别名；旧算子未替换。
 
 结构包格式版本 1、2 均可加载。loader 在 meta 上建立模型、应用结构合同、严格加载
 权重并重建非持久 RoPE buffer，随后移到目标设备。旧实验的安全结构包无需迁移。
@@ -70,7 +82,7 @@ full_group_sparse_model_dir 指定这两个子目录各自的父目录。默认�
 
 ## 明确边界
 
-- 当前支持原生 Phi MHA、普通带 bias 的 Linear、eager attention；不支持 GQA、量化投影、LoRA 合并和 ONNX 导出。
+- 当前支持原生 Phi MHA、普通带 bias 的 Linear、eager attention；不支持 GQA、量化投影和 LoRA 合并。
 - head_dim 要求 qk_layernorm=False；保留完整双维组且每层至少保留一组。
 - 已压缩模型可推理、生成和微调；再次结构剪枝尚未维护复合原始坐标，创建新 OTO 时明确拒绝。
 - 可在创建优化器之前按参数名保护完整依赖组。图节点 ID、ONNX 可视化和图 FLOPs 接口不用于原生适配，调用时明确报错。
@@ -88,3 +100,12 @@ CUDA_VISIBLE_DEVICES='' python test/pretrain_yolo11_coco/test_segmented_concat_c
 另在实际 Phi-2 权重上验证三种模式的 OTO 工厂训练、construct_subnet、严格结构
 等价、独立进程 load_subnet、实际 KV cache、缓存续写、生成和反向传播。结果及
 运行路径记录在部署验收报告，不将测试运行产物提交到源代码仓库。
+
+## 注释、日志与实验协议
+
+剪枝入口会同步输出终端、UTF-8 run.log 和 events.jsonl；每步统计另存 training_trace.jsonl。
+阶段日志包括数据角色/数量、token 长度、数据和源码摘要、FP32 与可训练参数量、LoRA 参数量、
+候选预算、CRIC 阶段、学习率、梯度、α、剪除组数、显存、NLL、结构审计与保存路径。
+失败保存 traceback 和 failure.json；这些信息不替代尚未实施的七任务评测或 LoRA 恢复。
+预处理单独保存 prepare.log，先过滤空响应再固定种子选样，原始 row_id 与旧冻结数据保留。
+详细数据/论文审查见 phi2-experiment-protocol-audit-20261028.md。
