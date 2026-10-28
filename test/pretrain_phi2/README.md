@@ -1,8 +1,11 @@
 # Phi-2 的 AdaMCF / HESSO-CRIC 结构剪枝
 
+当前实验按用户 2026-10-29 最新要求：仅使用本框架与表格七个数据集，train 用于剪枝/恢复，官方 validation/test 仅评测；不用原版优化器，不用 Alpaca。文献表格只作外部参考。
+当前运行入口与数据配方见 `docs/phi2-seven-task-run-20261029.md`。下方旧 Alpaca 命令保留为历史功能验证说明，不是本轮实验命令。
+
 目录位置：`/zeng/GY/OTOv2_v2/test/pretrain_phi2`。
 
-沿用 BERT/VGG 的模型和剪枝产物布局。数据预处理、结构适配、训练与独立验收分别实现，使用已有环境，不需要安装新包。
+沿用 BERT/VGG 的模型和剪枝产物布局。数据预处理、结构适配、训练与独立验收分别实现；剪枝使用既有个人环境，七任务预处理/评测使用隔离 venv 的固定版官方 lm-eval。
 
 ```text
 pretrain_phi2/

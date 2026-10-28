@@ -51,6 +51,7 @@ class PruningConfig:
     post_pruning_steps: int = 4
     adaptive_alpha: bool = True
     alpha_eval_batches: int = 1
+    alpha_batch_size: int = 0
     alpha_seed: int = 43
     recovery: dict = field(default_factory=dict)
     grad_clip_norm: float = 1.0
@@ -202,7 +203,7 @@ def run(args):
         config.export_format=args.export_format
     if config.export_format not in ('pt','torch','onnx','safetensors'):
         raise ValueError('导出格式必须为 pt/torch、onnx 或 safetensors。')
-    if (config.batch_size < 1 or config.alpha_eval_batches < 1 or config.log_every < 1
+    if (config.batch_size < 1 or config.alpha_eval_batches < 1 or config.alpha_batch_size < 0 or config.log_every < 1
             or config.post_pruning_steps < 0 or config.warmup_steps < 0):
         raise ValueError('批量和日志间隔必须为正，预热和剪后尾段步数不能为负。')
     from finetune_phi2_lora import RecoveryConfig, require_peft, validate_config
@@ -214,7 +215,7 @@ def run(args):
         raise FileExistsError('输出目录已存在；请为新实验使用独立目录。')
     args.output.mkdir(parents=True)
     args.created_output = True
-    log_stage(args.output,'1/6 数据','读取已冻结的 Alpaca 功能数据；eval 表示内部响应 NLL，不是七项 benchmark。',config=asdict(config))
+    log_stage(args.output,'1/6 数据','读取冻结的监督数据；内部 eval NLL 与七项 benchmark 准确率分开记录。',config=asdict(config))
     device = torch.device(args.device)
     torch.set_num_threads(4)
     random.seed(config.seed)
@@ -241,7 +242,7 @@ def run(args):
     loaders = {}
     for split in ('train', 'alpha', 'eval'):
         dataset = PreparedDataset(args.data_dir, split, manifest)
-        loaders[split] = DataLoader(dataset, batch_size=config.batch_size,
+        loaders[split] = DataLoader(dataset, batch_size=(config.alpha_batch_size or config.batch_size) if split=='alpha' else config.batch_size,
                                     shuffle=split in ('train','alpha'),
                                     generator=generator if split=='train' else alpha_generator if split=='alpha' else None,
                                     collate_fn=partial(collate_alpha_examples,pad_token_id=manifest['pad_token_id']) if split=='alpha' else collate,
@@ -273,7 +274,7 @@ def run(args):
     write_json(args.output / 'inputs.json', inputs)
     before_count = parameter_count(model)
     baseline = evaluate_response_loss(model, loaders['eval'], device)
-    log_stage(args.output,'3/6 剪前诊断','仅报告冻结 Alpaca 子集的响应 NLL。',**baseline)
+    log_stage(args.output,'3/6 剪前诊断','仅报告训练来源内部保留子集的监督 NLL。',**baseline)
     oto = OTO(model=model, pruning_mode=config.pruning_mode)
     groups = oto.get_param_groups()
     write_json(args.output / 'parameter_groups.json', group_summary(groups))
@@ -293,12 +294,22 @@ def run(args):
                       'projection_steps': optimizer.start_global_sampling_step - optimizer.start_cric_step,
                       'baseline': baseline, **memory_stats(device)})
     if args.profile_only:
-        batch = to_device(next(iter(loaders['train'])), device)
+        # 用冻结训练池最长样本探测峰值，避免只测到第一个短样本。
+        worst=sorted(loaders['train'].dataset.rows,key=lambda row:len(row['input_ids']),reverse=True)[:config.batch_size]
+        batch = to_device(collate(worst), device)
         model.train()
         model(**batch, use_cache=False).loss.backward()
         optimizer.preview_grad_variant()
         optimizer.compute_importance_scores()
-        profile = {'state': 'profile_only', 'pruning_performed': False, **memory_stats(device)}
+        if config.adaptive_alpha:
+            alpha_size=config.alpha_batch_size or config.batch_size
+            alpha_worst=sorted(loaders['alpha'].dataset.rows,key=lambda row:len(row['input_ids']),reverse=True)[:alpha_size]
+            model.eval()
+            with torch.no_grad():model(**to_device(collate(alpha_worst),device),use_cache=False)
+        profile = {'state': 'profile_only', 'pruning_performed': False,
+                   'profile_train_length':int(batch['input_ids'].shape[1]),
+                   'profile_alpha_batch_size':(config.alpha_batch_size or config.batch_size) if config.adaptive_alpha else 0,
+                   **memory_stats(device)}
         write_json(args.output / 'profile.json', profile)
         print(json.dumps(profile), flush=True)
         return
@@ -337,6 +348,7 @@ def run(args):
     with torch.no_grad():
         sparse_logits = model(**probe, use_cache=False).logits.detach()
     # 在更换 Parameter 之前释放旧优化器的参数引用、缓存和梯度。
+    score_criteria_for_report=dict(optimizer.importance_score_criteria)
     optimizer.zero_grad(set_to_none=True)
     del optimizer, groups, oto
     gc.collect()
@@ -351,6 +363,7 @@ def run(args):
                 'sparse_logits': sparse_logits.cpu(), 'atol': config.equivalence_atol,
                 'rtol': config.equivalence_rtol}, args.output / 'sparse_probe.pt')
     context = {'full_benchmark_evaluated': False,
+              'method':'adamcf_hesso_cric','importance_score_criteria':score_criteria_for_report,
               'lora_recovery_performed':False,'training_dtype':'float32','export_format':config.export_format,
               'lora_recovery_requested':recovery_config.enabled,
               'onnx_atol':config.onnx_atol,'onnx_rtol':config.onnx_rtol,

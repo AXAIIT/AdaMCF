@@ -1,17 +1,20 @@
 {
-  "status": "reviewed_proposal_not_an_executable_evaluator",
-  "formal_experiments_started": false,
-  "runner_implemented": false,
+  "status": "executable_seven_task_protocol_user_train_split_recipe",
+  "execution_state_source": "experiment controller_status.json and experiment_summary.json",
+  "runner_implemented": true,
   "reference_harness_commit": "d6de81643928d653435c431bae19945d41d32520",
   "num_fewshot_proposal": 0,
   "fewshot_is_not_claimed_as_paper_exact_setting": true,
   "apply_chat_template_proposal": false,
   "backend_proposal": "pytorch_eager",
   "dtype_proposal": "float32",
-  "pruning_and_recovery_data_roles": "Alpaca-only is functional smoke data; formal corpus must be aligned to author evidence first, never use the seven evaluation splits for training",
+  "pruning_and_recovery_data_roles": "Only seven official train splits; train/alpha/internal-eval are disjoint sampled subsets; official validation/test remain final evaluation only; no Alpaca",
+  "author_exact_samples_required": false,
+  "user_framework_only": true,
+  "paper_baseline_reference": "paper_phi2_reference.json",
   "formal_corpus_alignment_complete": false,
   "formal_corpus_alignment_manifest": "corpus_alignment.json",
-  "primary_average_proposal": "unweighted mean of seven task acc values; preserve acc_norm separately",
+  "primary_average_proposal": "Report both mean acc and normalized-style mean, with metric map; author exact mixing remains unverified",
   "stages_to_compare": [
     "original_pretrained",
     "physically_pruned_before_recovery",
@@ -21,10 +24,10 @@
   "lora_recovery_validation": "tiny Phi CPU pipeline; actual Phi-2 formal recovery has not started",
   "lora_policy": "attach LoRA only after physical pruning; freeze base; train A/B without a pruning optimizer",
   "training_data_issues": [
-    "128-token proof truncation must be replaced by a frozen formal recipe",
-    "proof alpha=2 remains smoke data; shared optimizer alpha policy selects evaluation batches and records actual pool coverage",
-    "new preprocessing filters empty responses; old manifests are unchanged",
-    "check benchmark contamination before formal runs"
+    "current seven-task recipe uses 2048 max tokens, filters overlength training candidates and preserves complete continuations",
+    "448 independent alpha rows from official train; shared optimizer policy records actual coverage",
+    "existing proof/Alpaca manifests remain unchanged and are not used by this experiment",
+    "exact question duplicates between sampled training candidates and official evaluation were excluded"
   ],
   "freeze_before_execution": [
     "training corpus and max_length",

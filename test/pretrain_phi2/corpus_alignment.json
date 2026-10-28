@@ -1,7 +1,13 @@
 {
-  "status": "incomplete_author_phi2_sample_manifest_not_publicly_verified",
+  "status": "author_exact_match_not_required_user_seven_task_train_recipe",
+  "author_exact_samples_required": false,
+  "process_reproduction_allowed": true,
+  "active_recipe": "seven_official_train_splits_user_recipe_v1",
+  "active_uses_alpaca": false,
+  "active_optimizer": "our_adamcf_hesso_cric_not_original_upstream",
+  "active_baseline": "reported table values in paper_phi2_reference.json, not local measurements",
   "formal_alignment_complete": false,
-  "current_alpaca_only_role": "functional_smoke_not_a_dataset_matched_paper_reproduction",
+  "current_alpaca_only_role": "historical smoke only, excluded from the active experiment",
   "reference_chain": [
     {
       "source": "https://arxiv.org/html/2409.09085v2#S4.SS6",
@@ -68,5 +74,5 @@
     "source mixing ratios, sample counts and token budgets",
     "sample IDs/content hashes, order and split assignments"
   ],
-  "action_boundary": "Do not claim data alignment or launch formal dataset-matched experiments until missing evidence is resolved; existing smoke evidence and seven-task splits remain unchanged"
+  "action_boundary": "User explicitly approved workflow reproduction without author exact samples, then required our framework only and seven listed datasets only. Use only their train splits for pruning/LoRA and their official heldout splits for final evaluation; record all deviations. No original optimizer and no Alpaca."
 }

@@ -1,0 +1,14 @@
+{
+  "source": "https://arxiv.org/html/2409.09085v2#S4.SS6",
+  "kind": "reported_paper_numbers_not_local_measurements",
+  "task_order": ["boolq", "piqa", "hellaswag", "winogrande", "arc_easy", "arc_challenge", "openbookqa"],
+  "dense_phi2_percent": [83.30, 79.11, 73.82, 75.77, 80.05, 54.18, 51.40],
+  "dense_reported_average_percent": 71.09,
+  "hesso_cric_reported_percent": {
+    "20": [69.67, 74.37, 62.27, 66.54, 72.30, 41.44, 38.20],
+    "25": [67.06, 73.77, 58.51, 65.18, 70.66, 38.60, 38.00],
+    "30": [67.61, 72.14, 53.11, 62.75, 62.74, 34.81, 36.20]
+  },
+  "hesso_cric_reported_average_percent": {"20": 60.67, "25": 58.74, "30": 55.62},
+  "exact_metric_mixing_and_sample_recipe_publicly_verified": false
+}
