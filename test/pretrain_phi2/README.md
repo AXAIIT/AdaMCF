@@ -199,3 +199,9 @@ ONNX：`session = OTO.load_subnet(package, device="cpu")`，`logits = session(in
 新数据预处理过滤空响应并保存 prepare.log；不会重写已有 proof_v1 数据。
 evaluation_protocol.json 是七任务评测的审查提案，不是已经可执行的评测器，也不代表任务实验已开始。
 正式实验前需冻结长度/截断、训练与 α 池、LoRA 配方、评测实现和指标口径；见框架 docs 的协议审查文档。
+
+后续来源审查与只读长度统计见 `docs/phi2-data-lora-reference-review-20261028.md`：
+官方 Alpaca 模板下，当前有效数据最长 1044 tokens，2048 上限可完整保留；
+旧 128-token 预处理和配置仍是功能验证版本，没有被静默替换为正式协议。
+LoRA 候选保护由 `HESSOCRIC` 统一执行，覆盖评分、预算、置零、辅助传播和恢复检查；
+无需逐模型复制参数名判断。LoRA 恢复训练入口尚未接入，不能把正常尾段训练称为 LoRA 微调。

@@ -109,3 +109,8 @@ CUDA_VISIBLE_DEVICES='' python test/pretrain_yolo11_coco/test_segmented_concat_c
 失败保存 traceback 和 failure.json；这些信息不替代尚未实施的七任务评测或 LoRA 恢复。
 预处理单独保存 prepare.log，先过滤空响应再固定种子选样，原始 row_id 与旧冻结数据保留。
 详细数据/论文审查见 phi2-experiment-protocol-audit-20261028.md。
+
+LoRA 参数的候选排除统一位于 `optimizer/hesso_cric.py`，Phi 适配只检查结构合同。
+保护标准 `lora_*` 路径段对应的张量，不参与评分/预算/置零，保留普通梯度更新。
+这不支持在 PEFT 包装投影上直接做原生 Phi 物理导出；恢复阶段仍应先压缩基座再附加 LoRA。
+后续数据来源、长度测量和 BERT 两阶段流程对照见 `phi2-data-lora-reference-review-20261028.md`。

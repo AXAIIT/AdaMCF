@@ -226,11 +226,17 @@ class PhiFrameworkTests(unittest.TestCase):
                     if fmt=='onnx':
                         with self.assertRaisesRegex(RuntimeError,'推理格式'):loaded.train()
 
-    def test_lora_is_not_accepted_as_a_pruning_candidate(self):
+    def test_lora_policy_is_owned_by_cric_instead_of_phi_adapter(self):
         model=tiny_model()
         model.register_parameter('lora_A',nn.Parameter(torch.ones(2,32)))
-        with self.assertRaisesRegex(ValueError,'先剪枝'):
-            OTO(model)
+        oto=OTO(model)
+        with contextlib.redirect_stdout(io.StringIO()):
+            opt=oto.hessocric(lr=.01,sampling_steps=2,hybrid_training_steps=4,
+                             alpha_scheduler_cfg={'warmup_updates':0})
+        self.assertIn(id(model.lora_A),opt._lora_tensor_ids)
+        for group in opt.param_groups:
+            if any(p is model.lora_A for p in group['params']):
+                self.assertFalse(group['is_prunable'])
 
     def test_optional_float16_package_preserves_dtype(self):
         model, plan = zeroed_model_and_plan()

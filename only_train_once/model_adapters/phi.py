@@ -18,9 +18,11 @@ from ..transform import TensorTransform
 
 
 def validate_native_phi(model):
-    """剪枝阶段只接受原生基座；LoRA 应在结构固定后另行附加并训练。"""
-    if any('lora_' in name.lower() for name, _ in model.named_parameters()):
-        raise ValueError('当前原生 Phi 剪枝不接受 LoRA 参数；请先剪枝，再附加 LoRA 恢复精度。')
+    """检查物理结构合同；LoRA 候选排除由 HESSOCRIC 统一负责。
+
+    PEFT 等投影包装层仍需满足下面的 nn.Linear 合同。当前恢复流程应在
+    基座物理压缩后附加 LoRA，不能把优化器保护等同于包装层导出支持。
+    """
     config = model.config
     if config.model_type != 'phi' or config.num_attention_heads != config.num_key_value_heads:
         raise ValueError('此适配只支持原生 Phi MHA，不支持 GQA 或其他模型类型。')

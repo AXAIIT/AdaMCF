@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from contextlib import contextmanager
 from torch.optim.optimizer import required
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
 from only_train_once.transform import tensor_transformation, TensorTransform, index_transformation_param_group, pruning_axis
@@ -678,4 +679,87 @@ from .cric_adapter import AdaptiveCRICMixin
 
 
 class HESSOCRIC(AdaptiveCRICMixin, _LegacyHESSOCRIC):
-    """使用 AdaMCF 五准则和周期边界 α 更新的 HESSO-CRIC。"""
+    """AdaMCF CRIC；LoRA 的候选排除在优化器入口统一执行。
+
+    参数名使用 PyTorch/PEFT 的标准路径段 ``lora_*``。保护只排除结构
+    剪枝和评分，不冻结正常梯度，也不代表物理导出已支持 PEFT 包装层。
+    """
+
+    def __init__(self, params, *args, **kwargs):
+        groups = list(params)
+        self._lora_tensor_ids = {
+            id(p) for group in groups
+            for name, p in zip(group['p_names'], group['params'], strict=True)
+            if any(part.lower().startswith('lora_') for part in name.split('.'))
+        }
+        protected_groups = []
+        for group in groups:
+            protected = [id(p) in self._lora_tensor_ids for p in group['params']]
+            if any(protected):
+                # 复制元数据，保留 Parameter 身份；不污染算子提供的原始分组。
+                group = dict(group)
+                group['params'] = list(group['params'])
+                group['p_names'] = list(group['p_names'])
+                group['p_transform'] = [
+                    transform if not keep or transform == TensorTransform.NO_UPDATE
+                    else TensorTransform.NO_PRUNE
+                    for transform, keep in zip(group['p_transform'], protected, strict=True)
+                ]
+                if all(t in (TensorTransform.NO_PRUNE, TensorTransform.NO_UPDATE)
+                       for t in group['p_transform']):
+                    # LoRA-only 组不能占用基座的剪枝预算。
+                    group['is_prunable'] = False
+            protected_groups.append(group)
+        super().__init__(protected_groups, *args, **kwargs)
+
+    @contextmanager
+    def _base_only_statistics(self):
+        """旧评分函数不统一跳过 NO_PRUNE，临时提供不含 LoRA 的统计视图。
+
+        只替换三项并行元数据，评分结果仍写回同一组；finally 保证异常时
+        恢复完整参数列表，正常优化步骤始终能够更新 A/B。
+        """
+        saved = []
+        try:
+            if self._lora_tensor_ids:
+                for group in self.param_groups:
+                    if not group['is_prunable'] or group['is_auxiliary']:
+                        continue
+                    keep = [i for i, p in enumerate(group['params'])
+                            if id(p) not in self._lora_tensor_ids]
+                    if len(keep) == len(group['params']):
+                        continue
+                    fields = {key: group[key] for key in ('params', 'p_names', 'p_transform')}
+                    saved.append((group, fields))
+                    for key, values in fields.items():
+                        group[key] = [values[i] for i in keep]
+            yield
+        finally:
+            for group, fields in saved:
+                group.update(fields)
+
+    def compute_importance_scores(self, **kwargs):
+        with self._base_only_statistics():
+            return super().compute_importance_scores(**kwargs)
+
+    def compute_metrics(self, **kwargs):
+        with self._base_only_statistics():
+            return super().compute_metrics(**kwargs)
+
+    def _pruning_slices(self, group, indexes):
+        # 辅助依赖传播也可能触达 A/B，不能只依赖主组的 NO_PRUNE 标记。
+        return [item for item in super()._pruning_slices(group, indexes)
+                if id(item[0]) not in self._lora_tensor_ids]
+
+    def load_state_dict(self, state_dict):
+        if self._lora_tensor_ids:
+            for old, current in zip(state_dict['param_groups'], self.param_groups):
+                if (old['p_names'] != current['p_names']
+                        or old['is_prunable'] != current['is_prunable']):
+                    raise ValueError('检查点参数组或 LoRA 剪枝预算不兼容。')
+                for p, transform in zip(current['params'], old['p_transform'], strict=True):
+                    if (id(p) in self._lora_tensor_ids
+                            and transform not in (TensorTransform.NO_PRUNE, TensorTransform.NO_UPDATE)):
+                        # 不能让旧检查点重新启用 LoRA 剪枝；不静默改写历史预算。
+                        raise ValueError('检查点未保护 LoRA 参数，不能安全恢复 CRIC。')
+        return super().load_state_dict(state_dict)
