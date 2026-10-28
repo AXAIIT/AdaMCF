@@ -32,10 +32,10 @@ pretrain_phi2/
 | --- | --- |
 | `prepare_phi2_data.py` | 固定互斥 train/alpha/eval 原始行索引，分词，保存 JSONL 与摘要 |
 | `phi2_data.py` | 校验和读取冻结数据、padding、生成模型输入 |
-| `phi2_structure.py` | 原生 Phi 参数组、物理压缩、异构逐层宽度的保存与重建 |
+| `phi2_structure.py`（兼容导入） | 原生 Phi 参数组、物理压缩、异构逐层宽度的保存与重建 |
 | `phi2_attention.py` | head_dim 局部适配，保持 RoPE 配对、频率和原 attention scaling |
 | `phi2_precision.py` | 原生 FP32 漂移记录和严格 FP64 结构对照，诊断后恢复原生实现 |
-| `export_phi2_pruned.py` | 从已保存的稀疏检查点独立物理导出，无需重跑训练 |
+| `export_phi2_pruned.py` | 调用 OTO.construct_subnet 从已保存稀疏检查点导出，并执行独立精度审计 |
 | `prune_phi2_hesso_cric.py` | 加载真实权重，运行完整 CRIC，检查零组，导出与对齐输出 |
 | `verify_phi2_pruning.py` | 新进程重载，检查参数量、logits、缓存生成和反向传播 |
 | `test_phi2_contract.py` | 随机小模型结构、数据隔离和输出保护测试 |
@@ -60,7 +60,7 @@ pretrain_phi2/
 - residual hidden size、embedding、LayerNorm、词表维度不做结构剪枝；这些参数与输出 bias 仍可训练。
 - 所有参数恰好归属一次。拒绝 GQA、量化 Linear、空保留组及非法结构索引。
 
-本地适配器按原生模块和实际宽度构造显式依赖合同，再调用已有 HESSOCRIC；它不使用面向旧 PhiMHA 的公共图算子。因此本次不代表通用图追踪器已支持任意 Phi 实现。公共 HESSO、CRIC 与既有模型算子没有为此修改。
+原生 Phi 的结构实现已迁入框架 `only_train_once/model_adapters/phi.py` 和 `operation/native_phi.py`，由 `OTO` 自动分派。训练使用 `oto.hessocric()`，物理裁剪和结构包保存使用 `oto.construct_subnet()`，重载使用 `OTO.load_subnet()`。本目录 `phi2_structure.py`、`phi2_attention.py` 保留旧导入路径，调用同一份框架实现。旧 `PhiMHA`、CNN、BERT、YOLO 等继续使用原有 Graph/ONNX 路径；此次新增原生模型结构适配不代表 ONNX 追踪器已支持任意 Phi 实现。
 
 五准则、自适应 α、周期内冻结和最终历史重融合使用此前已适配的 CRIC。joint 有 64 个可剪枝参数组，投影长度 384 步；三种独立模式各有 32 个可剪枝参数组，投影长度 192 步。投影试探步不等于普通梯度更新步。
 
@@ -159,3 +159,31 @@ response_nll 和 exp_response_nll 来自独立 Alpaca 响应检查样本，后�
 ```bash
 $P test_phi2_contract.py
 ```
+
+## 框架统一接口
+
+```python
+from only_train_once import OTO
+
+# 自动识别当前 Transformers 原生 PhiForCausalLM，无需 ONNX dummy_input。
+oto = OTO(model=model, pruning_mode="head_dim")  # joint / ffn / num_head / head_dim
+optimizer = oto.hessocric(
+    lr=1e-4, first_momentum=0., target_group_sparsity=.1,
+    start_cric_step=3, sampling_steps=2, max_cycle_period=2,
+    hybrid_training_steps=8,
+)
+# 训练及周期边界 α 更新沿用 prune_phi2_hesso_cric.py 的循环。
+# CRIC 完成、混合稀疏化结束且被剪结构精确归零后：
+oto.construct_subnet(out_dir="runs/example", tokenizer=tokenizer,
+                     ckpt_format="safetensors")
+compressed = OTO.load_subnet(oto.compressed_model_path, device="cuda:0")
+```
+
+该入口会原地改变模型结构；导出后旧优化器的 Parameter 引用不能继续使用。
+原生 Phi 输出 `out_dir/compressed_model/`，默认同时保存 `out_dir/sparse_model/`。
+已有稀疏检查点可通过 `pruning_plan=plan` 导出，框架会先检查所有删除位置精确为零。
+原生模型始终保存 safetensors + config.json + architecture.json；默认 `ckpt_format="torch"`
+也使用该安全结构包。`export_huggingface_format=True` 不会改变其需由 `OTO.load_subnet`
+重建异构结构的要求；tokenizer 参数可选，实际语言模型部署应提供。
+旧图模型的文件命名、torch/ONNX/HF 保存分支和旧算子注册保持原行为。
+详细兼容边界、回归测试和模块职责见 `docs/native-phi-adapter.md`。

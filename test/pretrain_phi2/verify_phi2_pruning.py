@@ -6,7 +6,8 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from phi2_structure import load_pruned_package, parameter_count
+from phi2_structure import parameter_count
+from only_train_once import OTO
 from phi2_data import file_sha256, to_device
 
 
@@ -20,7 +21,7 @@ def verify(args):
     package = run / 'compressed_model'
     if file_sha256(package / 'model.safetensors') != result['compressed_weights_sha256']:
         raise ValueError('压缩权重摘要与剪枝结果记录不一致。')
-    model = load_pruned_package(package, device)
+    model = OTO.load_subnet(package, device)
     if parameter_count(model) != result['parameters_after']:
         raise AssertionError('重载参数量错误。')
     plan = json.loads((package / 'architecture.json').read_text(encoding='utf-8'))

@@ -11,7 +11,7 @@ class OTO:
     最终生成可部署的子网络模型。
     """
     def __init__(self, model=None, dummy_input=None, compress_mode='prune', skip_patterns=None, strict_out_nodes=False,
-                 onnx_opset_version=None):
+                 onnx_opset_version=None, model_adapter='auto', pruning_mode='joint'):
         """
         初始化 OTO 实例。
         参数：
@@ -29,18 +29,29 @@ class OTO:
         self._strict_out_nodes = strict_out_nodes       # 输出节点是否严格处理，是否严格只将无出边节点作为输出节点
         self._onnx_opset_version = onnx_opset_version   # OTO 图追踪使用的 ONNX opset
         self._mode = compress_mode                      # 压缩模式
+        if model_adapter not in ('auto', 'graph', 'native_phi'):
+            raise ValueError('model_adapter 必须为 auto/graph/native_phi。')
+        self._model_adapter = None
+        self._adapter_selection = model_adapter
+        self._pruning_mode = pruning_mode
+        self._optimizer = None
+        self.pruning_plan = None
+        from .model_adapters import is_native_phi
         # 如果提供了模型和输入，则初始化图结构
-        if self._model is not None and self._dummy_input is not None:
+        if self._model is not None and (self._dummy_input is not None
+                                       or model_adapter == 'native_phi'
+                                       or (model_adapter == 'auto' and is_native_phi(model))):
             # 初始化模型的计算图（Graph），为后续的剪枝、优化和稀疏化操作提供基础。
-            print("正在创建计算图...")
+            print("正在初始化剪枝依赖...")
             self.initialize(model=self._model, dummy_input=self._dummy_input, skip_patterns=self._skip_patterns,
                             strict_out_nodes=self._strict_out_nodes, onnx_opset_version=self._onnx_opset_version)
-            print("计算图创建完成！")
+            print("剪枝依赖初始化完成：" + self.model_adapter_name)
             if self._mode == 'prune':
                 # 执行剪枝相关流程
-                self.partition_pzigs()                  # 构建剪枝依赖图
-                self.set_trainable()                    # 设置可训练参数
-                self._graph.cluster_node_groups()       # 聚合节点组（按照求分组聚类）
+                if self._model_adapter is None:
+                    self.partition_pzigs()                  # 构建剪枝依赖图
+                    self.set_trainable()                    # 设置可训练参数
+                    self._graph.cluster_node_groups()       # 聚合节点组（按照求分组聚类）
             elif self._mode == 'erase':
                 # 擦除模式暂未实现
                 raise NotImplementedError
@@ -54,7 +65,7 @@ class OTO:
         参数：
             num_clusters: 目标聚类数。
         """
-        self._graph.cluster_node_groups(num_clusters=num_clusters)
+        self._require_graph().cluster_node_groups(num_clusters=num_clusters)
 
     def initialize(self, model=None, dummy_input=None, skip_patterns=None, strict_out_nodes=False, onnx_opset_version=None):
         """
@@ -70,6 +81,16 @@ class OTO:
         model = model.eval()
         self._model = model 
         self._dummy_input = dummy_input
+        # 已注册原生模型通过显式结构合同构建依赖；其他模型沿用 Graph/ONNX。
+        # 不覆盖旧 PhiMHA 算子，避免把不同版本的注意力布局混为一谈。
+        from .model_adapters import create_model_adapter
+        self._model_adapter = create_model_adapter(
+            model, self._adapter_selection, self._pruning_mode)
+        if self._model_adapter is not None:
+            if skip_patterns or strict_out_nodes or onnx_opset_version is not None:
+                raise ValueError('原生模型适配不使用 ONNX 图选项，请使用 pruning_mode 选择候选。')
+            self._graph = None
+            return
         # 构建模型的计算图
         self._graph = Graph(
             model,
@@ -84,7 +105,35 @@ class OTO:
         构建剪枝依赖图（Pruning Dependency Graph）。
         pzigs 表示 pruning zigzag structure（剪枝锯齿结构），用于描述剪枝时各层之间的依赖关系。
         """
-        build_pruning_dependency_graph(self._graph)
+        build_pruning_dependency_graph(self._require_graph())
+
+    def _require_graph(self):
+        if self._model_adapter is not None:
+            raise NotImplementedError('该接口依赖 ONNX 图；原生模型请使用模型适配层接口。')
+        return self._graph
+
+    @property
+    def model_adapter_name(self):
+        return self._model_adapter.name if self._model_adapter is not None else 'graph'
+
+    def get_param_groups(self):
+        """优化器统一取组入口；原有 Graph 参数组原样传递。"""
+        if self._model_adapter is not None:
+            return self._model_adapter.get_param_groups()
+        if self._graph is None:
+            raise RuntimeError('OTO 尚未初始化；图模型需要 model 和 dummy_input。')
+        return self._graph.get_param_groups()
+
+    def collect_pruning_plan(self):
+        """冻结原生模型最终结构合同；现有图模型仍在 construct_subnet 时推导。"""
+        if self._model_adapter is None:
+            raise NotImplementedError('此接口用于模型适配层，图模型继续调用 construct_subnet。')
+        return self._model_adapter.collect_pruning_plan(self._optimizer)
+
+    @staticmethod
+    def load_subnet(directory, device='cpu'):
+        from .model_adapters import load_subnet
+        return load_subnet(directory, device)
 
     def visualize(self, out_dir=None, view=False, vertical=True, by_node_groups=True, display_params=False, display_flops=False):
         """
@@ -110,7 +159,7 @@ class OTO:
         #   - 最后追加 '_pruning_dependency' 作为文件名后缀，表明这是剪枝依赖图。
         # view: 控制是否在渲染完成后自动打开生成的文件（通常是图片或PDF）。
         '''
-        self._graph.build_dot(vertical=vertical, by_node_groups=by_node_groups, display_params=display_params, display_flops=display_flops).render(\
+        self._require_graph().build_dot(vertical=vertical, by_node_groups=by_node_groups, display_params=display_params, display_flops=display_flops).render(\
             os.path.join(out_dir if out_dir is not None else './', \
                 self._model.name if hasattr(self._model, 'name') else type(self._model).__name__ + '_pruning_dependency'), \
                 view=view)
@@ -150,7 +199,7 @@ class OTO:
         self._optimizer = HESSO(
             # params: 从 OTO 的图对象 (_graph) 中获取参数组。
             # _graph.get_param_groups() 应该返回一个适合优化器处理的参数列表或参数组列表。
-            params=self._graph.get_param_groups(),
+            params=self.get_param_groups(),
             lr=lr,                                                  # 学习率
             weight_decay=weight_decay,                              # 权重衰减（L2 正则化）
             first_momentum=first_momentum,                          # 一阶动量系数
@@ -180,7 +229,7 @@ class OTO:
     
         from .optimizer import HESSOCRIC  # 动态导入 HESSOCric 优化器类
 
-        self.optimizer = HESSOCRIC(params=self._graph.get_param_groups(),                  # 优化器的参数组
+        self.optimizer = HESSOCRIC(params=self.get_param_groups(),                  # 优化器的参数组
                                     variant=variant,                                        # 基础优化器类型
                                     lr=lr,                                                  # 学习率
                                     first_momentum=first_momentum,                          # 一阶动量系数
@@ -199,6 +248,9 @@ class OTO:
                                     alpha_scheduler_cfg=alpha_scheduler_cfg,
                                     adaptive_alpha=adaptive_alpha,
                                     )
+        self._optimizer = self.optimizer
+        if self._model_adapter is not None:
+            self.optimizer.phi_pruning_mode = self._pruning_mode
         return self.optimizer                                      # 返回创建的优化器实例
     
 
@@ -208,16 +260,17 @@ class OTO:
         参数：
             operator_list: 要跳过的算子名称列表。
         """
-        self._graph.skip_operators(operator_list)
+        self._require_graph().skip_operators(operator_list)
 
     def set_trainable(self):
         """
         根据剪枝依赖图设置哪些参数为可训练状态。
         """
-        self._graph.set_trainable()
+        self._require_graph().set_trainable()
 
     def construct_subnet(self, merge_lora_to_base=False, unmerge_lora_to_base=False, export_huggingface_format=False, export_float16=False, out_dir='./', \
-                 full_group_sparse_model_dir=None, compressed_model_dir=None, save_full_group_sparse_model=True, ckpt_format='torch'):
+                 full_group_sparse_model_dir=None, compressed_model_dir=None, save_full_group_sparse_model=True, ckpt_format='torch',
+                 pruning_plan=None, tokenizer=None):
         """
         根据剪枝图构建最终子网络并保存模型。
         参数：
@@ -231,6 +284,21 @@ class OTO:
             save_full_group_sparse_model: 是否保存全组稀疏模型。
             ckpt_format: 检查点保存格式（如 torch、safetensors 等）。
         """
+        if self._model_adapter is not None:
+            if self._mode != 'prune':
+                raise NotImplementedError('原生模型适配当前仅支持 prune。')
+            self.compressed_model_path, self.full_group_sparse_model_path, self.pruning_plan = (
+                self._model_adapter.construct_subnet(
+                    optimizer=self._optimizer, pruning_plan=pruning_plan, tokenizer=tokenizer,
+                    out_dir=out_dir, full_group_sparse_model_dir=full_group_sparse_model_dir,
+                    compressed_model_dir=compressed_model_dir,
+                    save_full_group_sparse_model=save_full_group_sparse_model,
+                    export_float16=export_float16, ckpt_format=ckpt_format,
+                    merge_lora_to_base=merge_lora_to_base,
+                    unmerge_lora_to_base=unmerge_lora_to_base))
+            return
+        if pruning_plan is not None or tokenizer is not None:
+            raise ValueError('pruning_plan/tokenizer 参数仅适用于已注册模型适配层。')
         # 确定全组稀疏模型的保存目录。
         # 如果 full_group_sparse_model_dir 未指定（为 None），则使用默认的 out_dir。否则，使用用户指定的 full_group_sparse_model_dir。
         full_group_sparse_model_dir = out_dir if full_group_sparse_model_dir is None else full_group_sparse_model_dir
@@ -266,7 +334,7 @@ class OTO:
         参数：
             target_group_sparsity: 目标稀疏度（0~1）。
         """
-        self._graph.random_set_zero_groups(target_group_sparsity=target_group_sparsity)
+        self._require_graph().random_set_zero_groups(target_group_sparsity=target_group_sparsity)
 
     def mark_unprunable_by_node_ids(self, node_ids=list()):
         """
@@ -275,7 +343,7 @@ class OTO:
             node_ids: 不可剪枝节点 ID 列表。
         """
         # 遍历图对象中所有的节点组 (node_groups)。
-        for node_group in self._graph.node_groups.values():
+        for node_group in self._require_graph().node_groups.values():
             # 对于每个节点组，再遍历传入的 node_ids 列表。
             for node_id in node_ids:
                 # 检查当前的 node_id 是否存在于当前 node_group 的节点集合 (node_group.nodes) 中。
@@ -291,6 +359,13 @@ class OTO:
             param_names: 不可剪枝参数名列表。
         """
         param_names_set = set(param_names)
+        if self._model_adapter is not None:
+            if self._optimizer is not None:
+                raise RuntimeError('请在创建优化器之前设置不可剪参数。')
+            for group in self.get_param_groups():
+                if set(group['p_names']) & param_names_set:
+                    group['is_prunable'] = False
+            return
         for node_group in self._graph.node_groups.values():
             if set(node_group.param_names) & param_names_set:
                 node_group.is_prunable = False
@@ -302,7 +377,7 @@ class OTO:
             in_million: 是否以百万单位返回。
             in_billion: 是否以十亿单位返回。
         """
-        return self._graph.compute_flops(in_million=in_million, in_billion=in_billion)
+        return self._require_graph().compute_flops(in_million=in_million, in_billion=in_billion)
 
     def compute_num_params(self, in_million=True, in_billion=False):
         """
@@ -311,5 +386,8 @@ class OTO:
             in_million: 是否以百万单位返回。
             in_billion: 是否以十亿单位返回。
         """
+        if self._model_adapter is not None:
+            count = sum(p.numel() for p in self._model.parameters())
+            return count / (1e9 if in_billion else 1e6 if in_million else 1)
         return self._graph.compute_num_params(in_million=in_million, in_billion=in_billion)
     

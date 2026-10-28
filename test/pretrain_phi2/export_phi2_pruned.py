@@ -4,13 +4,15 @@ import copy
 import gc
 import json
 from pathlib import Path
+import tempfile
 
 import torch
 from transformers import AutoTokenizer, PhiForCausalLM
 
 from phi2_data import file_sha256, to_device
 from phi2_precision import audit_structure_precision
-from phi2_structure import apply_structure, parameter_count, save_pruned_package
+from phi2_structure import parameter_count
+from only_train_once import OTO
 
 
 def export_run(run, device):
@@ -30,11 +32,22 @@ def export_run(run, device):
     torch.testing.assert_close(reloaded_sparse, probe['sparse_logits'].to(device),
                                atol=probe['atol'], rtol=probe['rtol'])
     compressed = copy.deepcopy(sparse)
-    apply_structure(compressed, plan)
-    after_count = parameter_count(compressed)
-    if not after_count < context['parameters_before']:
-        raise AssertionError('实际参数量没有减少。')
-    diagnostics, compact_logits = audit_structure_precision(sparse, compressed, batch)
+    # 框架统一调度物理裁剪与结构包保存。先写唯一临时目录，审计通过后
+    # 原子发布为 compressed_model；失败不会留下看似可用的最终模型包。
+    staging = tempfile.TemporaryDirectory(prefix='.export-', dir=run)
+    try:
+        oto = OTO(model=compressed, pruning_mode=plan.get('pruning_mode', 'joint'))
+        oto.construct_subnet(out_dir=staging.name, ckpt_format='safetensors',
+                             save_full_group_sparse_model=False,
+                             pruning_plan=plan, tokenizer=tokenizer)
+        plan = oto.pruning_plan
+        after_count = parameter_count(compressed)
+        if not after_count < context['parameters_before']:
+            raise AssertionError('实际参数量没有减少。')
+        diagnostics, compact_logits = audit_structure_precision(sparse, compressed, batch)
+        Path(oto.compressed_model_path).rename(run / 'compressed_model')
+    finally:
+        staging.cleanup()
     (run / 'precision_audit.json').write_text(json.dumps(diagnostics, indent=2), encoding='utf-8')
     plan['parameters_after'] = after_count
     # 独立重载应对齐同一压缩结构的原生 FP32 参考；稀疏/压缩结构等价
@@ -47,7 +60,6 @@ def export_run(run, device):
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     package = run / 'compressed_model'
-    save_pruned_package(compressed, tokenizer, plan, package)
     (run / 'pruning_plan.json').write_text(json.dumps(plan, indent=2), encoding='utf-8')
     report = {**context, 'functional_pruning_passed': True,
               'parameters_after': after_count,

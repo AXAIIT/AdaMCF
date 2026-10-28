@@ -21,10 +21,9 @@ from transformers import AutoTokenizer, PhiForCausalLM
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
-from only_train_once.optimizer import HESSOCRIC
+from only_train_once import OTO
 from phi2_data import PreparedDataset, collate_examples, file_sha256, load_manifest, to_device
-from phi2_structure import (build_param_groups, collect_pruning_plan,
-                            group_summary, parameter_count)
+from phi2_structure import group_summary, parameter_count
 
 
 @dataclass
@@ -191,13 +190,20 @@ def run(args):
               'torch': torch.__version__, 'gpu': torch.cuda.get_device_name(device) if device.type == 'cuda' else None,
               'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
               'code_sha256': {p.name: file_sha256(p) for p in HERE.glob('*.py')}}
+    framework = HERE.parents[1] / 'only_train_once'
+    inputs['framework_code_sha256'] = {
+        str(p.relative_to(framework)): file_sha256(p)
+        for p in [framework/'__init__.py', *sorted((framework/'model_adapters').glob('*.py')),
+                  framework/'operation/native_phi.py', framework/'optimizer/hesso_cric.py',
+                  framework/'optimizer/cric_adapter.py', framework/'optimizer/cric_alpha.py']}
     write_json(args.output / 'inputs.json', inputs)
     before_count = parameter_count(model)
     baseline = evaluate_response_loss(model, loaders['eval'], device)
-    groups = build_param_groups(model, config.pruning_mode)
+    oto = OTO(model=model, pruning_mode=config.pruning_mode)
+    groups = oto.get_param_groups()
     write_json(args.output / 'parameter_groups.json', group_summary(groups))
-    optimizer = HESSOCRIC(
-        groups, variant=config.optimizer_variant, lr=config.learning_rate,
+    optimizer = oto.hessocric(
+        variant=config.optimizer_variant, lr=config.learning_rate,
         first_momentum=config.first_momentum, weight_decay=config.weight_decay,
         target_group_sparsity=config.target_group_sparsity,
         start_cric_step=config.warmup_steps + 1,
@@ -223,7 +229,7 @@ def run(args):
         return
 
     final_step = train_cric(model, optimizer, loaders['train'], loaders['alpha'], config, args.output, device)
-    plan = collect_pruning_plan(model, optimizer)
+    plan = oto.collect_pruning_plan()
     plan['parameters_before'] = before_count
     plan['pruned_logical_groups'] = sum(len(entry[kind]['pruned'])
                                        for entry in plan['layers'] for kind in ('ffn', 'attention'))
@@ -256,7 +262,7 @@ def run(args):
         sparse_logits = model(**probe, use_cache=False).logits.detach()
     # 在更换 Parameter 之前释放旧优化器的参数引用、缓存和梯度。
     optimizer.zero_grad(set_to_none=True)
-    del optimizer, groups
+    del optimizer, groups, oto
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
