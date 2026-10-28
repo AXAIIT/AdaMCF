@@ -28,7 +28,7 @@ head_dim 采用等宽双维逻辑组，旋转区维度按 rotate_half 配对；�
 
 五准则、α 更新、历史重融合和 CRIC 时间流程继续使用公共优化器。本次不修改
 optimizer、graph、dependency_graph、旧 operator.py 或通用 pruning_compression.py。
-测试目录的 phi2_structure.py / phi2_attention.py 是兼容导入入口，不再维护第二份结构实现。
+测试与训练代码直接导入框架模块，不再保留独立结构兼容文件。
 
 ## 导出与加载
 
@@ -63,8 +63,8 @@ full_group_sparse_model_dir 指定这两个子目录各自的父目录。默认�
 权重并重建非持久 RoPE buffer，随后移到目标设备。旧实验的安全结构包无需迁移。
 导出在原模型上更换 Parameter，旧优化器不再适用；同一 OTO 重复物理导出会报错。
 
-实验脚本 export_phi2_pruned.py 负责调用 construct_subnet 并在临时目录保存结果，
-通过精度审计后发布最终 compressed_model。物理索引操作已统一由框架执行。
+剪枝入口 prune_phi2_hesso_cric.py 的 export_run 负责调用 construct_subnet 并在临时目录保存结果，
+通过精度审计后发布最终 compressed_model。物理索引操作已统一由框架执行。已有检查点可用 `--export-only --output RUN_DIR` 重试导出，无需数据集参数和重新训练。
 原生 FP32 稀疏/压缩误差和严格 FP64 结构等价门槛分开记录，独立重载再对齐同一
 压缩结构 FP32 参考。功能通过不表示下游准确率或吞吐已达标。
 

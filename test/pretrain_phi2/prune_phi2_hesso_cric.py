@@ -4,6 +4,8 @@
 物理压缩 → 稀疏/压缩输出对齐 → 保存结构包。数据预处理独立执行。
 """
 import argparse
+import copy
+import tempfile
 from dataclasses import asdict, dataclass
 from functools import partial
 import gc
@@ -23,7 +25,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1]))
 from only_train_once import OTO
 from phi2_data import PreparedDataset, collate_examples, file_sha256, load_manifest, to_device
-from phi2_structure import group_summary, parameter_count
+from only_train_once.model_adapters.phi import group_summary, parameter_count
+from phi2_precision import audit_structure_precision
 
 
 @dataclass
@@ -288,19 +291,91 @@ def run(args):
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-    from export_phi2_pruned import export_run
     export_run(args.output, device)
+
+
+
+def export_run(run, device):
+    run, device = Path(run), torch.device(device)
+    if (run / 'compressed_model').exists():
+        raise FileExistsError('压缩包已存在，拒绝覆盖。')
+    context = json.loads((run / 'export_context.json').read_text(encoding='utf-8'))
+    plan = json.loads((run / 'pruning_plan.json').read_text(encoding='utf-8'))
+    probe = torch.load(run / 'sparse_probe.pt', map_location='cpu', weights_only=True)
+    batch = to_device(probe['batch'], device)
+    sparse = PhiForCausalLM.from_pretrained(
+        run / 'sparse_model', local_files_only=True, torch_dtype=torch.float32,
+        attn_implementation='eager').to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(run / 'sparse_model', local_files_only=True)
+    with torch.no_grad():
+        reloaded_sparse = sparse(**batch, use_cache=False).logits
+    torch.testing.assert_close(reloaded_sparse, probe['sparse_logits'].to(device),
+                               atol=probe['atol'], rtol=probe['rtol'])
+    compressed = copy.deepcopy(sparse)
+    # 框架统一调度物理裁剪与结构包保存。先写唯一临时目录，审计通过后
+    # 原子发布为 compressed_model；失败不会留下看似可用的最终模型包。
+    staging = tempfile.TemporaryDirectory(prefix='.export-', dir=run)
+    try:
+        oto = OTO(model=compressed, pruning_mode=plan.get('pruning_mode', 'joint'))
+        oto.construct_subnet(out_dir=staging.name, ckpt_format='safetensors',
+                             save_full_group_sparse_model=False,
+                             pruning_plan=plan, tokenizer=tokenizer)
+        plan = oto.pruning_plan
+        after_count = parameter_count(compressed)
+        if not after_count < context['parameters_before']:
+            raise AssertionError('实际参数量没有减少。')
+        diagnostics, compact_logits = audit_structure_precision(sparse, compressed, batch)
+        Path(oto.compressed_model_path).rename(run / 'compressed_model')
+    finally:
+        staging.cleanup()
+    (run / 'precision_audit.json').write_text(json.dumps(diagnostics, indent=2), encoding='utf-8')
+    plan['parameters_after'] = after_count
+    # 独立重载应对齐同一压缩结构的原生 FP32 参考；稀疏/压缩结构等价
+    # 单独由更严格的 FP64 门槛确认，FP32 漂移完整保留为诊断结果。
+    torch.save({'batch': probe['batch'], 'sparse_logits': probe['sparse_logits'],
+                'compressed_logits': compact_logits.cpu(), 'atol': probe['atol'],
+                'rtol': probe['rtol']}, run / 'equivalence_probe.pt')
+    del sparse, reloaded_sparse
+    gc.collect()
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    package = run / 'compressed_model'
+    (run / 'pruning_plan.json').write_text(json.dumps(plan, indent=2), encoding='utf-8')
+    report = {**context, 'functional_pruning_passed': True,
+              'parameters_after': after_count,
+              'parameter_reduction_ratio': 1 - after_count / context['parameters_before'],
+              'precision_audit': diagnostics,
+              'sparse_compressed_logits_max_abs_error': diagnostics['native_fp32']['max_abs_error'],
+              'compressed_package': str(package),
+              'compressed_weights_sha256': file_sha256(package / 'model.safetensors')}
+    if device.type == 'cuda':
+        report.update(peak_allocated_GiB=torch.cuda.max_memory_allocated(device) / 2**30,
+                      peak_reserved_GiB=torch.cuda.max_memory_reserved(device) / 2**30)
+    for name in ('pruning_result.json', 'status.json'):
+        (run / name).write_text(json.dumps({'state': 'completed', **report}, indent=2), encoding='utf-8')
+    print('PRUNING_COMPLETE', json.dumps(report), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=HERE / 'phi2_smoke_config.json')
     parser.add_argument('--model-dir', type=Path, default=HERE / 'models/phi-2')
-    parser.add_argument('--data-dir', type=Path, required=True)
+    parser.add_argument('--data-dir', type=Path, help='训练模式必填；仅导出时不需要。')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--profile-only', action='store_true', help='只测全梯度、评分与缓存显存，不执行剪枝。')
+    parser.add_argument('--export-only', action='store_true', help='仅从 --output 的已有稀疏检查点调用框架导出，无需重训。')
     args = parser.parse_args()
+    if args.export_only:
+        if args.profile_only:
+            parser.error('--export-only 与 --profile-only 不能同时使用。')
+        torch.set_num_threads(4)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        export_run(args.output, args.device)
+        return
+    if args.data_dir is None:
+        parser.error('训练模式需要 --data-dir；已有稀疏检查点可使用 --export-only。')
     try:
         run(args)
     except Exception as error:

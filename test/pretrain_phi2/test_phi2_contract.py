@@ -4,16 +4,19 @@ import copy
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import torch
 from transformers import PhiConfig, PhiForCausalLM
 
 from phi2_data import PreparedDataset, collate_examples, load_manifest
-from phi2_structure import (apply_structure, build_param_groups, collect_pruning_plan,
+from only_train_once.model_adapters.phi import (apply_structure, build_param_groups, collect_pruning_plan,
                             load_pruned_package, parameter_count, save_pruned_package)
 from prepare_phi2_data import prepare
 from only_train_once.optimizer import HESSOCRIC

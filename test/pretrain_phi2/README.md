@@ -32,11 +32,8 @@ pretrain_phi2/
 | --- | --- |
 | `prepare_phi2_data.py` | 固定互斥 train/alpha/eval 原始行索引，分词，保存 JSONL 与摘要 |
 | `phi2_data.py` | 校验和读取冻结数据、padding、生成模型输入 |
-| `phi2_structure.py`（兼容导入） | 原生 Phi 参数组、物理压缩、异构逐层宽度的保存与重建 |
-| `phi2_attention.py` | head_dim 局部适配，保持 RoPE 配对、频率和原 attention scaling |
 | `phi2_precision.py` | 原生 FP32 漂移记录和严格 FP64 结构对照，诊断后恢复原生实现 |
-| `export_phi2_pruned.py` | 调用 OTO.construct_subnet 从已保存稀疏检查点导出，并执行独立精度审计 |
-| `prune_phi2_hesso_cric.py` | 加载真实权重，运行完整 CRIC，检查零组，导出与对齐输出 |
+| `prune_phi2_hesso_cric.py` | 运行完整 CRIC 并调用框架导出；--export-only 从已有稀疏检查点独立导出与审计 |
 | `verify_phi2_pruning.py` | 新进程重载，检查参数量、logits、缓存生成和反向传播 |
 | `test_phi2_contract.py` | 随机小模型结构、数据隔离和输出保护测试 |
 | `phi2_smoke_config.json` | 可读的功能验收配置，可另存为独立实验配置 |
@@ -60,7 +57,7 @@ pretrain_phi2/
 - residual hidden size、embedding、LayerNorm、词表维度不做结构剪枝；这些参数与输出 bias 仍可训练。
 - 所有参数恰好归属一次。拒绝 GQA、量化 Linear、空保留组及非法结构索引。
 
-原生 Phi 的结构实现已迁入框架 `only_train_once/model_adapters/phi.py` 和 `operation/native_phi.py`，由 `OTO` 自动分派。训练使用 `oto.hessocric()`，物理裁剪和结构包保存使用 `oto.construct_subnet()`，重载使用 `OTO.load_subnet()`。本目录 `phi2_structure.py`、`phi2_attention.py` 保留旧导入路径，调用同一份框架实现。旧 `PhiMHA`、CNN、BERT、YOLO 等继续使用原有 Graph/ONNX 路径；此次新增原生模型结构适配不代表 ONNX 追踪器已支持任意 Phi 实现。
+原生 Phi 的结构实现已迁入框架 `only_train_once/model_adapters/phi.py` 和 `operation/native_phi.py`，由 `OTO` 自动分派。训练使用 `oto.hessocric()`，物理裁剪和结构包保存使用 `oto.construct_subnet()`，重载使用 `OTO.load_subnet()`。实验代码直接导入框架结构实现，独立兼容文件已清理。旧 `PhiMHA`、CNN、BERT、YOLO 等继续使用原有 Graph/ONNX 路径；此次新增原生模型结构适配不代表 ONNX 追踪器已支持任意 Phi 实现。
 
 五准则、自适应 α、周期内冻结和最终历史重融合使用此前已适配的 CRIC。joint 有 64 个可剪枝参数组，投影长度 384 步；三种独立模式各有 32 个可剪枝参数组，投影长度 192 步。投影试探步不等于普通梯度更新步。
 
@@ -119,7 +116,7 @@ $P prune_phi2_hesso_cric.py --data-dir "$DATA" --config phi2_head_dim_smoke_conf
 训练结束后先保存稀疏检查点。若导出诊断失败且尚未产生 compressed_model，可独立重试：
 
 ```bash
-$P export_phi2_pruned.py --run-dir runs/my_phi2_run
+$P prune_phi2_hesso_cric.py --export-only --output runs/my_phi2_run
 ```
 
 profile-only 加载真实模型与 CRIC 缓存，执行全梯度和五准则评分，不执行剪枝。长任务应以后台进程启动，重定向 stdout/stderr；训练状态另外写入 JSON 和逐步日志。
@@ -150,7 +147,7 @@ profile-only 加载真实模型与 CRIC 缓存，执行全梯度和五准则评�
 
 真实深层 Phi 的矩阵尺寸改变会改变 FP32 GEMM 求和顺序，原生 FP32 稀疏/压缩 logits 可能不满足逐元素 2e-4 门槛；该失败标志和实测误差保留，不改写为通过。为判别结构错误与浮点漂移，另外执行严格 FP64 对照，诊断作用域内将 attention softmax 也提升为 FP64，RoPE 使用双方相同的原生位置常数。作用域退出即恢复 FP32，安装包、训练和正常推理使用原生实现。独立重载检查仍使用原有 FP32 容差，对齐相同压缩结构的参考输出。
 
-逐层剪后宽度可以不同，原始全局 PhiConfig 无法单独重建这种结构。**通过 phi2_structure.load_pruned_package() 加载压缩包**，不要直接用普通 AutoModelForCausalLM.from_pretrained() 加载本包。加载器用 meta 骨架和 JSON 清单重建，严格匹配 safetensors 键与形状，不反序列化任意 Python 模型对象。
+逐层剪后宽度可以不同，原始全局 PhiConfig 无法单独重建这种结构。**通过 OTO.load_subnet() 加载压缩包**，不要直接用普通 AutoModelForCausalLM.from_pretrained() 加载本包。加载器用 meta 骨架和 JSON 清单重建，严格匹配 safetensors 键与形状，不反序列化任意 Python 模型对象。
 
 ## 指标边界与测试
 

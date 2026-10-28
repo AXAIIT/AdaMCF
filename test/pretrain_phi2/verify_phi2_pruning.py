@@ -2,11 +2,14 @@
 import argparse
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import torch
 from transformers import AutoTokenizer
 
-from phi2_structure import parameter_count
+from only_train_once.model_adapters.phi import parameter_count
 from only_train_once import OTO
 from phi2_data import file_sha256, to_device
 

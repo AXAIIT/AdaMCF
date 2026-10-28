@@ -2,10 +2,12 @@
 import contextlib
 import copy
 import io
+import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -14,13 +16,46 @@ from torch import nn
 
 from test_phi2_contract import tiny_model, zeroed_model_and_plan
 from phi2_precision import audit_structure_precision
-from phi2_structure import load_pruned_package
+from only_train_once.model_adapters.phi import load_pruned_package
 from only_train_once import OTO
 from only_train_once.model_adapters import create_model_adapter
 from only_train_once.operation.operator import COMPOSED_MODULES, PhiAttentionOTO
 
 
 class PhiFrameworkTests(unittest.TestCase):
+    def test_export_only_cli_reuses_sparse_checkpoint_and_refuses_overwrite(self):
+        from prune_phi2_hesso_cric import main
+        model, plan = zeroed_model_and_plan()
+        tokens = torch.arange(8).reshape(1,-1)
+        batch = {'input_ids':tokens, 'labels':tokens}
+        with torch.no_grad():reference = model(**batch, use_cache=False).logits
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            model.save_pretrained(run/'sparse_model',safe_serialization=True)
+            (run/'pruning_plan.json').write_text(json.dumps(plan),encoding='utf-8')
+            (run/'export_context.json').write_text(json.dumps({
+                'parameters_before':sum(p.numel() for p in model.parameters())}),encoding='utf-8')
+            torch.save({'batch':batch,'sparse_logits':reference,'atol':1e-6,'rtol':1e-5},run/'sparse_probe.pt')
+            argv=['prune','--export-only','--output',str(run),'--device','cpu']
+            tokenizer=SimpleNamespace(save_pretrained=lambda _:None)
+            with patch('sys.argv',argv), patch('prune_phi2_hesso_cric.AutoTokenizer.from_pretrained',return_value=tokenizer):
+                with contextlib.redirect_stdout(io.StringIO()):main()
+            loaded = OTO.load_subnet(run/'compressed_model').eval()
+            probe = torch.load(run/'equivalence_probe.pt',weights_only=True)
+            with torch.no_grad():
+                torch.testing.assert_close(loaded(**batch,use_cache=False).logits,probe['compressed_logits'])
+            result = (run/'pruning_result.json').read_bytes()
+            with patch('sys.argv',argv), self.assertRaises(FileExistsError):main()
+            self.assertEqual((run/'pruning_result.json').read_bytes(),result)
+
+    def test_training_cli_requires_dataset_without_creating_output(self):
+        from prune_phi2_hesso_cric import main
+        with tempfile.TemporaryDirectory() as tmp:
+            output=Path(tmp)/'new_run'
+            with patch('sys.argv',['prune','--output',str(output)]):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):main()
+            self.assertFalse(output.exists())
+
     def test_auto_dispatch_uses_native_adapter_without_onnx(self):
         with patch('only_train_once.Graph', side_effect=AssertionError('不应调用追踪器')):
             for mode in ('joint', 'ffn', 'num_head', 'head_dim'):
