@@ -106,7 +106,9 @@ CUDA_VISIBLE_DEVICES='' python test/pretrain_yolo11_coco/test_segmented_concat_c
 剪枝入口会同步输出终端、UTF-8 run.log 和 events.jsonl；每步统计另存 training_trace.jsonl。
 阶段日志包括数据角色/数量、token 长度、数据和源码摘要、FP32 与可训练参数量、LoRA 参数量、
 候选预算、CRIC 阶段、学习率、梯度、α、剪除组数、显存、NLL、结构审计与保存路径。
-失败保存 traceback 和 failure.json；这些信息不替代尚未实施的七任务评测或 LoRA 恢复。
+失败保存 traceback 和 failure.json；这些信息不替代正式七任务评测结果。
+独立 LoRA 恢复已由 test/pretrain_phi2/finetune_phi2_lora.py 接入，先重载框架压缩包，再附加 A/B；
+恢复后合并模型复用本适配层的 save_pruned_package 序列化，不再次调用物理剪枝。
 预处理单独保存 prepare.log，先过滤空响应再固定种子选样，原始 row_id 与旧冻结数据保留。
 详细数据/论文审查见 phi2-experiment-protocol-audit-20261028.md。
 

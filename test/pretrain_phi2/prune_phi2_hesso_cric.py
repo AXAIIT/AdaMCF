@@ -1,12 +1,12 @@
 """真实 Phi-2 的 AdaMCF/HESSO-CRIC 结构剪枝入口。
 
 顺序：读取冻结数据 → 加载原权重 → CRIC 全流程 → 精确零组检查 →
-物理压缩 → 稀疏/压缩输出对齐 → 保存结构包。数据预处理独立执行。
+物理压缩并重载 → 可选的独立 LoRA 恢复 → 保存结构包。数据预处理独立执行。
 """
 import argparse
 import copy
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import partial
 import gc
 import json
@@ -29,6 +29,7 @@ from only_train_once import OTO
 from phi2_data import PreparedDataset, collate_examples, file_sha256, load_manifest, to_device
 from only_train_once.model_adapters.phi import group_summary, parameter_count
 from phi2_precision import audit_structure_precision
+from phi2_alpha import AlphaBatchStream, collate_alpha_examples
 
 
 @dataclass
@@ -50,6 +51,8 @@ class PruningConfig:
     post_pruning_steps: int = 4
     adaptive_alpha: bool = True
     alpha_eval_batches: int = 1
+    alpha_seed: int = 43
+    recovery: dict = field(default_factory=dict)
     grad_clip_norm: float = 1.0
     log_every: int = 10
     equivalence_atol: float = 0.0002
@@ -136,11 +139,7 @@ def phase_name(optimizer):
 def train_cric(model, optimizer, train_loader, alpha_loader, config, output, device):
     """全梯度 CRIC；post_pruning 是本次联合训练的尾段，不是 LoRA 恢复。"""
     # alpha 与 train/eval 是互斥的原始行索引，预处理清单已经核对。
-    alpha_batches = []
-    for batch in alpha_loader:
-        alpha_batches.append((to_device(batch, device), None))
-        if len(alpha_batches) >= config.alpha_eval_batches:
-            break
+    alpha_stream = AlphaBatchStream(alpha_loader, device)
     maximum_steps = (optimizer.start_global_sampling_step
                      + config.sampling_steps * config.max_cycle_period
                      + config.hybrid_training_steps + config.post_pruning_steps + 2)
@@ -164,14 +163,25 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
             norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.grad_clip_norm, error_if_nonfinite=True)
             updated = False
+            alpha_ids, alpha_tokens, alpha_batch_count = [], 0, 0
             if optimizer.will_update_alpha_on_next_step():
+                alpha_batches, sampled_ids = alpha_stream.draw(optimizer)
                 updated = optimizer.alpha_scheduler.update(model, None, alpha_batches)
+                if updated:
+                    alpha_ids = sampled_ids
+                    alpha_stream.commit(alpha_ids)
+                    alpha_batch_count = len(alpha_batches)
+                    alpha_tokens = sum(int((b['labels'][:,1:] != -100).sum()) for b,_ in alpha_batches)
+                del alpha_batches  # 本次更新结束即释放显存中的 α 微批。
             optimizer.step(loss=loss.detach())
             record = {'step': optimizer.num_steps, 'phase': phase_name(optimizer),
                       'loss': float(loss.detach()), 'gradient_norm_before_clip': float(norm),
                       'cric_cycle': optimizer.curr_cycle_period,
                       'alpha': optimizer.alpha_scheduler.alpha.detach().cpu().tolist(),
                       'alpha_updated': updated,
+                      'alpha_row_ids':alpha_ids,'alpha_microbatches':alpha_batch_count,
+                      'alpha_supervised_tokens':alpha_tokens,
+                      'alpha_unique_samples_seen':len(alpha_stream.used_row_ids),
                       'learning_rate':optimizer.param_groups[0]['lr'],
                       'pruned_logical_groups':sum(len(g.get('pruned_idxes',[])) for g in optimizer.param_groups if g['is_prunable']),
                       'elapsed_seconds': time.perf_counter() - started}
@@ -188,15 +198,20 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
 
 
 def run(args):
-    """读取冻结数据后联合训练剪枝；本入口不安装 LoRA，也不执行七任务评测。"""
+    """阶段一全梯度剪枝；压缩重载后才进入独立 LoRA 阶段，不执行七任务评测。"""
     config = PruningConfig(**json.loads(args.config.read_text(encoding='utf-8')))
     if getattr(args,'export_format',None) is not None:
         config.export_format=args.export_format
     if config.export_format not in ('pt','torch','onnx','safetensors'):
         raise ValueError('导出格式必须为 pt/torch、onnx 或 safetensors。')
     if (config.batch_size < 1 or config.alpha_eval_batches < 1 or config.log_every < 1
-            or config.post_pruning_steps < 1 or config.warmup_steps < 0):
-        raise ValueError('批量、日志间隔和剪后步数必须为正，预热步数不能为负。')
+            or config.post_pruning_steps < 0 or config.warmup_steps < 0):
+        raise ValueError('批量和日志间隔必须为正，预热和剪后尾段步数不能为负。')
+    from finetune_phi2_lora import RecoveryConfig, require_peft, validate_config
+    recovery_config = RecoveryConfig(**config.recovery)
+    validate_config(recovery_config)
+    if recovery_config.enabled and not args.profile_only:
+        require_peft()  # 开始长时间剪枝前发现依赖问题，脚本不自动安装或升级包。
     if args.output.exists():
         raise FileExistsError('输出目录已存在；请为新实验使用独立目录。')
     args.output.mkdir(parents=True)
@@ -224,12 +239,15 @@ def run(args):
             raise ValueError(f'模型目录的 {name} 与冻结数据使用的分词器/配置不一致。')
     collate = partial(collate_examples, pad_token_id=manifest['pad_token_id'])
     generator = torch.Generator().manual_seed(config.seed)
+    alpha_generator = torch.Generator().manual_seed(config.alpha_seed)
     loaders = {}
     for split in ('train', 'alpha', 'eval'):
         dataset = PreparedDataset(args.data_dir, split, manifest)
         loaders[split] = DataLoader(dataset, batch_size=config.batch_size,
-                                    shuffle=split == 'train', generator=generator if split == 'train' else None,
-                                    collate_fn=collate, num_workers=0)
+                                    shuffle=split in ('train','alpha'),
+                                    generator=generator if split=='train' else alpha_generator if split=='alpha' else None,
+                                    collate_fn=partial(collate_alpha_examples,pad_token_id=manifest['pad_token_id']) if split=='alpha' else collate,
+                                    num_workers=0)
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token
     model = PhiForCausalLM.from_pretrained(
@@ -336,6 +354,7 @@ def run(args):
                 'rtol': config.equivalence_rtol}, args.output / 'sparse_probe.pt')
     context = {'full_benchmark_evaluated': False,
               'lora_recovery_performed':False,'training_dtype':'float32','export_format':config.export_format,
+              'lora_recovery_requested':recovery_config.enabled,
               'onnx_atol':config.onnx_atol,'onnx_rtol':config.onnx_rtol,
               'pruning_mode': config.pruning_mode,
               'parameters_before': before_count,
@@ -350,7 +369,23 @@ def run(args):
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-    export_run(args.output, device)
+    # ONNX 不能训练；需要恢复时先保存可训练中间包，最终仍按用户选择导出。
+    base_format = 'safetensors' if recovery_config.enabled and config.export_format=='onnx' else config.export_format
+    export_run(args.output, device, base_format)
+    if recovery_config.enabled:
+        from finetune_phi2_lora import run_recovery
+        write_json(args.output/'status.json',{'state':'running','stage':'lora_recovery',
+                                             'compressed_package':str(args.output/'compressed_model')})
+        recovery = run_recovery(args.output/'compressed_model',args.data_dir,
+                                args.output/'lora_recovery',recovery_config,device,
+                                export_format=config.export_format)
+        pruning = json.loads((args.output/'pruning_result.json').read_text(encoding='utf-8'))
+        workflow = {'state':'completed','two_stage':True,'pruning':pruning,'recovery':recovery,
+                    'full_benchmark_evaluated':False}
+        write_json(args.output/'workflow_result.json',workflow)
+        write_json(args.output/'status.json',workflow)
+        log_stage(args.output,'两阶段完成','CRIC 压缩与独立 LoRA 恢复均完成；任务准确率仍需另行评测。',
+                  recovered_package=recovery['recovered_package'])
 
 
 
@@ -430,8 +465,8 @@ def export_run(run, device, export_format=None):
     if device.type == 'cuda':
         report.update(peak_allocated_GiB=torch.cuda.max_memory_allocated(device) / 2**30,
                       peak_reserved_GiB=torch.cuda.max_memory_reserved(device) / 2**30)
-    for name in ('pruning_result.json', 'status.json'):
-        (run / name).write_text(json.dumps({'state': 'completed', **report}, indent=2), encoding='utf-8')
+    write_json(run/'pruning_result.json',{'state':'completed',**report})
+    write_json(run/'status.json',{'state':'pruning_completed' if context.get('lora_recovery_requested') else 'completed',**report})
     log_stage(run,'完成','结构审计与导出完成；正式任务准确率及 LoRA 恢复尚未执行。',
               export_format=selected_format,parameters_after=after_count,
               reduction=report['parameter_reduction_ratio'],structure_fp64=diagnostics['structure_fp64'],
@@ -440,7 +475,7 @@ def export_run(run, device, export_format=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=HERE / 'phi2_smoke_config.json')
+    parser.add_argument('--config', type=Path, default=HERE / 'phi2_two_stage_smoke_config.json')
     parser.add_argument('--model-dir', type=Path, default=HERE / 'models/phi-2')
     parser.add_argument('--data-dir', type=Path, help='训练模式必填；仅导出时不需要。')
     parser.add_argument('--output', type=Path, required=True)
@@ -470,6 +505,8 @@ def main():
     except Exception as error:
         if getattr(args, 'created_output', False):
             write_json(args.output / 'failure.json', {'state': 'failed', 'error': repr(error)})
+            write_json(args.output / 'status.json', {'state': 'failed', 'error': repr(error),
+                       'pruning_result_preserved':(args.output/'pruning_result.json').is_file()})
             run_logger(args.output).exception('运行失败，未把失败记录标记为成功。')
         raise
 

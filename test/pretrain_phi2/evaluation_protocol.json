@@ -15,11 +15,12 @@
     "physically_pruned_before_recovery",
     "post_pruning_lora_recovered"
   ],
-  "lora_recovery_implemented": false,
+  "lora_recovery_implemented": true,
+  "lora_recovery_validation": "tiny Phi CPU pipeline; actual Phi-2 formal recovery has not started",
   "lora_policy": "attach LoRA only after physical pruning; freeze base; train A/B without a pruning optimizer",
   "training_data_issues": [
     "128-token proof truncation must be replaced by a frozen formal recipe",
-    "alpha=2 with limit=1 is a smoke setup, not a reliable formal validation pool",
+    "proof alpha=2 remains a smoke pool; new loader traverses the full frozen alpha pool with an independent shuffle seed and logs actual coverage",
     "new preprocessing filters empty responses; old manifests are unchanged",
     "check benchmark contamination before formal runs"
   ],

@@ -193,7 +193,7 @@ compressed = OTO.load_subnet(oto.compressed_model_path, device="cuda:0")
 每个输出目录只发布一种格式；已有 compressed_model 时拒绝覆盖。
 CLI 旧配置默认 safetensors，API 默认 torch/pt；日志与结果会记录实际格式。
 ONNX：`session = OTO.load_subnet(package, device="cpu")`，`logits = session(input_ids, attention_mask)`。
-其余两种格式返回 PyTorch 模型。格式与训练精度分开，当前全梯度剪枝固定 FP32，无 LoRA 恢复。
+其余两种格式返回 PyTorch 模型。格式与训练精度分开，当前剪枝与独立 LoRA 恢复均固定 FP32。
 
 终端与 run.log 同步输出阶段信息，events.jsonl 保存结构事件，training_trace.jsonl 保存每步记录。
 新数据预处理过滤空响应并保存 prepare.log；不会重写已有 proof_v1 数据。
@@ -204,4 +204,43 @@ evaluation_protocol.json 是七任务评测的审查提案，不是已经可执�
 官方 Alpaca 模板下，当前有效数据最长 1044 tokens，2048 上限可完整保留；
 旧 128-token 预处理和配置仍是功能验证版本，没有被静默替换为正式协议。
 LoRA 候选保护由 `HESSOCRIC` 统一执行，覆盖评分、预算、置零、辅助传播和恢复检查；
-无需逐模型复制参数名判断。LoRA 恢复训练入口尚未接入，不能把正常尾段训练称为 LoRA 微调。
+无需逐模型复制参数名判断。独立恢复入口已接入，见下文；旧 post_pruning_steps 仍是全梯度尾段。
+
+## 两阶段剪枝与 LoRA 恢复
+
+默认配置现为 `phi2_two_stage_smoke_config.json`，组织参考 BERT 的剪枝/压缩重载/新优化器微调流程：
+阶段一全梯度 CRIC，不附加 LoRA；阶段二从磁盘重载压缩基座、冻结基座、按实际矩阵尺寸附加 A/B，使用独立 AdamW。
+新 smoke 配置的 post_pruning_steps=0、恢复仅 4 步，是功能验证配方；旧显式配置继续只剪枝，不会被自动开启 LoRA。
+
+```bash
+# DATA 指向已经冻结的数据目录。正式配方尚未确定，不应直接把 smoke 当正式实验。
+$P prune_phi2_hesso_cric.py --data-dir "$DATA" --config phi2_two_stage_smoke_config.json \
+  --output runs/my_two_stage --export-format safetensors
+
+# 已有可训练压缩包时，可单独运行阶段二，不必重新剪枝。
+$P finetune_phi2_lora.py --base-dir runs/my_phi2_run/compressed_model \
+  --data-dir "$DATA" --config phi2_two_stage_smoke_config.json \
+  --output runs/my_recovery --export-format pt
+```
+
+阶段二依赖 PEFT，已在个人环境验证 `requirements-lora.txt` 的 0.17.1；不修改公共 Torch/CUDA。
+恢复使用 train，内部验证使用 eval；alpha 不参与恢复梯度，七项 benchmark 也不作为此处训练/选模数据。
+梯度累积按真实监督 token 加权，日志保存损失、token 数、学习率、梯度范数与内部 NLL。
+逐参数 SHA256 检查确认训练期间基座不变；只允许 A/B 出现梯度和更新。
+
+α 池由独立种子 alpha_seed 打乱并持续遍历，不再长期缓存最前面的批次。仍保持 CRIC 原周期边界、渐增微批规则和最终 α 重融合。
+一次 α 差分更新内所有扰动复用同一批样本；training_trace.jsonl 记录实际行号、微批、监督 token 与累计独立覆盖量。gap 等条件跳过的更新不计入覆盖。
+
+产物：`compressed_model/` 是阶段一基座，`lora_recovery/adapter/` 保存 A/B，`recovery_manifest.json` 绑定基座和 adapter 摘要；
+`lora_recovery/recovered_model/` 保存合并后的完整结构包，可选 pt/safetensors/onnx。ONNX 模式先保留 safetensors 中间基座供训练，最终恢复产物再导出 ONNX。
+合并只发生在恢复完成后，训练期间的冻结检查与合并产物中的 W+BA 不是同一数值状态。
+
+适配器必须用框架结构 loader 重建基座，禁止 AutoModel 根据原始全局宽度猜测异构结构：
+
+```python
+from finetune_phi2_lora import load_recovery
+model = load_recovery("runs/my_two_stage/lora_recovery", device="cpu")
+```
+
+workflow_result.json 记录两阶段结果；单独剪枝成功不再使等待恢复的总体任务标记为完成。阶段二失败时保留阶段一结果及独立失败日志。
+本次仅在小型 Phi 上完成四类剪枝模式、三格式和真实 LoRA 的 CPU 回归；未启动真实 Phi-2 正式恢复或七任务评测。

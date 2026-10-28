@@ -1,0 +1,2 @@
+# 只新增 PEFT；沿用个人环境既有 torch/CUDA/transformers 等包。
+peft==0.17.1
