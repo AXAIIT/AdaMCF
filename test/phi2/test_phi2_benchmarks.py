@@ -2,13 +2,22 @@
 import json
 import os
 from pathlib import Path
+import sys
 import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+
+# 单独运行或 unittest discover 时，生产模块统一从模型目录导入。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PHI2_DIR = PROJECT_ROOT / 'test' / 'pretrain_phi2'
+for directory in (PROJECT_ROOT, PHI2_DIR):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
 from test_phi2_contract import tiny_model
 from test_phi2_training import tokenizer
-from phi2_benchmark_tasks import training_pair,load_protocol
+from phi2_data import training_pair,load_protocol
 from prepare_phi2_benchmark_data import encode_pair
 
 
@@ -31,7 +40,7 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_protocol_contains_seven_and_paper_numbers_are_external(self):
         self.assertEqual(len(load_protocol()),7)
-        paper=json.loads((Path(__file__).parent/'paper_phi2_reference.json').read_text())
+        paper=json.loads((PHI2_DIR/'paper_phi2_reference.json').read_text())
         self.assertAlmostEqual(sum(paper['dense_phi2_percent'])/7,71.09)
         self.assertIn('not_local',paper['kind'])
 
@@ -41,7 +50,7 @@ class BenchmarkTests(unittest.TestCase):
             root=Path(tmp);base=root/'tiny';base.mkdir()
             tiny_model().save_pretrained(base);tokenizer().save_pretrained(base)
             output=root/'evaluation'
-            script=Path(__file__).parent/'evaluate_phi2_benchmarks.py'
+            script=PHI2_DIR/'evaluate_phi2_benchmarks.py'
             command=[os.environ['PHI2_EVAL_PYTHON'],str(script),'--model-kind','dense','--model-dir',str(base),
                      '--output',str(output),'--device','cpu','--limit','2']
             result=subprocess.run(command,capture_output=True,text=True,env=dict(os.environ,CUDA_VISIBLE_DEVICES=''),timeout=180)

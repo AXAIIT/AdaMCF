@@ -14,8 +14,7 @@ from transformers import AutoTokenizer,PhiForCausalLM
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE.parents[1]))
 from only_train_once import OTO
-from phi2_benchmark_tasks import load_protocol,build_task,HARNESS_REVISION
-from phi2_data import file_sha256
+from phi2_data import HARNESS_REVISION, build_task, file_sha256, load_protocol
 
 
 def json_default(value):

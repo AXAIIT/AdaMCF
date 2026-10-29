@@ -91,8 +91,8 @@ input_ids 与 attention_mask 输入和 logits 输出，不提供 KV cache、反�
 ## 回归命令
 
 ```bash
-CUDA_VISIBLE_DEVICES='' python test/pretrain_phi2/test_phi2_contract.py
-CUDA_VISIBLE_DEVICES='' python test/pretrain_phi2/test_phi2_framework.py
+CUDA_VISIBLE_DEVICES='' python test/phi2/test_phi2_contract.py
+CUDA_VISIBLE_DEVICES='' python test/phi2/test_phi2_framework.py
 CUDA_VISIBLE_DEVICES='' python test/hesso_cric/test_adamcf_cric.py
 CUDA_VISIBLE_DEVICES='' python test/pretrain_yolo11_coco/test_segmented_concat_contract.py --output /path/to/new/evidence
 ```

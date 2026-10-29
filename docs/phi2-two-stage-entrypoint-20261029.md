@@ -34,7 +34,7 @@ $P -u pretrain_phi2_pruning.py \
 ```
 
 `--export-format` 可选 pt、safetensors、onnx；ONNX 时阶段一保留可训练 safetensors，阶段二最终模型导出 ONNX。`--log-every 1` 可逐步输出；未指定则保留配置中各阶段的日志间隔。
-GPU 选择遵守 `CUDA_VISIBLE_DEVICES` 与 `--device`；需要自动等空闲卡并运行七项全量评测时，使用原 `run_phi2_seven_task_experiment.py`，它已改为调用新总入口训练。
+GPU 选择遵守 `CUDA_VISIBLE_DEVICES` 与 `--device`；需要自动等空闲卡并运行七项全量评测时，使用原 `pretrain_phi2_pruning.py --benchmarks`，它已改为调用新总入口训练。
 
 ## 输出与日志
 
@@ -67,3 +67,7 @@ runs/my_phi2_two_stage/
 
 使用真实小型 Phi 覆盖 joint/num_head/head_dim/ffn 和 pt/safetensors/onnx；相同输入、种子与配方下，比对旧入口与新入口最终模型的全部 state_dict 张量及 α。检查阶段一不会再次启动 LoRA、配置不被改写、失败状态/已有目录保护，并验证七任务控制器的脚本与模型路径。
 该改动是主流程组织与共享参数检查，不改变训练算法或此前实验权重；本次不重新运行完整 Phi-2 GPU 训练。
+
+## 目录整理
+
+独立验证已并入剪枝入口的 --verify-only，七任务调度已并入本总入口的 --benchmarks。生产目录共七个 Python 文件；测试统一在 test/phi2。详见模型目录 README。

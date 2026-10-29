@@ -4,21 +4,30 @@ from dataclasses import asdict
 import io
 import json
 from pathlib import Path
+import sys
 import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+
+# 单独运行或 unittest discover 时，生产模块统一从模型目录导入。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PHI2_DIR = PROJECT_ROOT / 'test' / 'pretrain_phi2'
+for directory in (PROJECT_ROOT, PHI2_DIR):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
 import torch
 
 import pretrain_phi2_pruning as entry
-import run_phi2_seven_task_experiment as controller
+import pretrain_phi2_pruning as controller
 from finetune_phi2_lora import RecoveryConfig
 from only_train_once import OTO
 from phi2_data import file_sha256
-from prepare_phi2_data import prepare
-from prune_phi2_hesso_cric import PruningConfig, run as legacy_run
+from test_phi2_contract import prepare
+from prune_phi2_hesso_cric import PruningConfig, main as pruning_cli, run as legacy_run
 from test_phi2_contract import tiny_model
 from test_phi2_training import tokenizer
 
@@ -80,6 +89,14 @@ class PhiEntrypointTests(unittest.TestCase):
                     self.assertEqual(result['recovery']['export_format'], fmt)
                     self.assertEqual(json.loads((args.output / 'status.json').read_text())['state'], 'completed')
                     self.assertIn('内部响应 NLL', (args.output / 'summary.md').read_text())
+                    threads = torch.get_num_threads()
+                    try:
+                        with patch('sys.argv',['prune','--verify-only','--output',str(args.output/'stage1_pruning'),
+                                               '--device','cpu']), contextlib.redirect_stdout(io.StringIO()):
+                            pruning_cli()
+                    finally:
+                        torch.set_num_threads(threads)
+                    self.assertTrue(json.loads((args.output/'stage1_pruning/independent_verification.json').read_text())['passed'])
                     log_before = file_sha256(args.output / 'run.log')
                     with self.assertRaises(FileExistsError):
                         entry.main(args)
@@ -153,6 +170,7 @@ class PhiEntrypointTests(unittest.TestCase):
                 pid = 1234
                 def __init__(self, command, **kwargs):
                     self.command = command
+                    self.stdout = io.StringIO('child progress\n')
                     commands.append(command)
                 def wait(self):
                     directory = Path(self.command[self.command.index('--output') + 1])
@@ -175,12 +193,30 @@ class PhiEntrypointTests(unittest.TestCase):
                  patch.object(controller, 'gpu_snapshot', return_value=gpu), \
                  patch.object(controller.time, 'sleep'), patch.object(controller.subprocess, 'Popen', Child), \
                  contextlib.redirect_stdout(io.StringIO()):
-                controller.run(args)
+                controller.run_benchmark_experiment(args)
             self.assertTrue(commands[0][2].endswith('prune_phi2_hesso_cric.py'))
             self.assertTrue(commands[1][2].endswith('pretrain_phi2_pruning.py'))
+            self.assertNotIn('--benchmarks',commands[1])
             self.assertIn(str(output / 'training/stage1_pruning/compressed_model'), commands[2])
             self.assertIn(str(output / 'training/stage2_finetuning/recovered_model'), commands[3])
             self.assertEqual(json.loads((output / 'controller_status.json').read_text())['state'], 'completed')
+            self.assertIn('child progress', (output / 'training.stdout.log').read_text())
+
+    def test_benchmark_mode_dispatch_and_onnx_preflight(self):
+        args=SimpleNamespace(benchmarks=True)
+        with patch.object(entry,'run_benchmark_experiment',return_value={'state':'test'}) as runner:
+            self.assertEqual(entry.main(args),{'state':'test'})
+            runner.assert_called_once_with(args)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);config=root/'config.json'
+            config.write_text(json.dumps({'export_format':'onnx','adaptive_alpha':True,'recovery':{'enabled':True}}))
+            args=SimpleNamespace(source_commit='a'*40,output=root/'out',data_dir=root/'data',
+                                 config=config,export_format=None,log_every=None)
+            names=['boolq','piqa','hellaswag','winogrande','arc_easy','arc_challenge','openbookqa']
+            with patch.object(entry,'load_manifest',return_value={'alpaca_used':False,'source_files':dict.fromkeys(names)}):
+                with self.assertRaisesRegex(ValueError,'七任务 GPU 评分需要'):
+                    entry.run_benchmark_experiment(args)
+            self.assertFalse(args.output.exists())
 
 
 if __name__ == '__main__':

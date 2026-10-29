@@ -9,8 +9,7 @@ import sys
 from transformers import AutoTokenizer
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE.parents[1]))
-from phi2_benchmark_tasks import load_protocol,build_task,training_pair,HARNESS_REVISION
-from phi2_data import file_sha256
+from phi2_data import HARNESS_REVISION, build_task, file_sha256, load_protocol, training_pair
 
 def encode_pair(context,continuation,tokenizer,max_length):
     encoded=tokenizer(context+continuation,add_special_tokens=False,return_offsets_mapping=True,

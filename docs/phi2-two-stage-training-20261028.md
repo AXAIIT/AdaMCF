@@ -62,7 +62,7 @@ Alpaca 内部响应 NLL 衡量已监督回答 token 的预测损失，不是上�
 - prune_phi2_hesso_cric.py：阶段一与两阶段调度，复用统一框架导出。
 - phi2_alpha.py：α 池持续随机排列取样及行号覆盖记录。
 - finetune_phi2_lora.py：独立恢复、冻结检查、保存和 adapter 重载，可单独执行。
-- prepare_phi2_data.py / phi2_data.py：仍独立负责预处理及冻结数据读取，不混入训练脚本。
+- prepare_phi2_benchmark_data.py / phi2_data.py：当前独立负责预处理及冻结数据读取，不混入训练脚本。
 
 ## 4. LoRA 和剪枝是否冲突
 
@@ -106,3 +106,5 @@ CPU 测试 59 项全部通过：原 CRIC 23、Phi 合同 14、框架 17、新两
 证据根目录：`/zeng/GY/phi2_two_stage_20261028/`。包含 dependency_result.json、安装前后包清单、四组 CPU 日志和 status.json；evidence/ 下保存六个用例的结果/行号/LoRA布局/逐步日志。小模型权重和合成样本是临时单元夹具，测试后已回收，记录中的临时目录不是正式模型交付目录。
 
 本次未运行真实 Phi-2 的正式 LoRA 恢复，未改原始权重、旧冻结 Alpaca 数据、既有剪枝实验或共享数据集。正式预处理 2048、池规模、训练步数和七任务评测协议仍需单独冻结；不能据此宣称任务准确率已恢复。
+
+目录整理说明：旧 Alpaca 预处理已退出生产目录；当前预处理只保留七任务入口，历史流程见本文所述版本的 Git 记录。

@@ -30,11 +30,11 @@
 
 新的两阶段阅读入口为 `pretrain_phi2_pruning.py`；七任务控制器训练部分也经由该入口执行。新输出使用 `training/stage1_pruning` 与 `training/stage2_finetuning`，详细阅读顺序和命令见 `phi2-two-stage-entrypoint-20261029.md`。本文后续的旧运行路径描述对应此前已完成实验，未移动其产物。
 
-- phi2_benchmark_tasks.py：固定官方模板/清洗定义与本地 parquet 适配。BoolQ 将 answer:boolean 映射到 label:int；HellaSwag 清洗、WinoGrande 后缀评分直接使用官方实现。
+- phi2_data.py：固定官方模板/清洗定义与本地 parquet 适配。BoolQ 将 answer:boolean 映射到 label:int；HellaSwag 清洗、WinoGrande 后缀评分直接使用官方实现。
 - prepare_phi2_benchmark_data.py：独立 CPU 预处理、分割、去重与摘要；不加载模型或占用 GPU。
 - prune_phi2_hesso_cric.py：本框架 CRIC，物理压缩后重载，执行独立 LoRA 恢复。原单模型入口仍可用。
 - evaluate_phi2_benchmarks.py：固定官方 lm-eval，按任务保存结果、逐例选择似然/预测和置信区间，可恢复完成到一半的评测。
-- run_phi2_seven_task_experiment.py：检查 GPU、资源探测、训练、剪后七任务、LoRA 后七任务和最终报告；数据预处理保持独立。
+- pretrain_phi2_pruning.py --benchmarks：检查 GPU、资源探测、训练、剪后七任务、LoRA 后七任务和最终报告；数据预处理保持独立。
 
 ## 固定配置
 

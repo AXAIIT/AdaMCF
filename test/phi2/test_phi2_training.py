@@ -6,11 +6,20 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+
+# 单独运行或 unittest discover 时，生产模块统一从模型目录导入。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PHI2_DIR = PROJECT_ROOT / 'test' / 'pretrain_phi2'
+for directory in (PROJECT_ROOT, PHI2_DIR):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
 
 import torch
 from torch.utils.data import DataLoader
@@ -25,7 +34,7 @@ from only_train_once.optimizer.alpha_data import AlphaBatch
 from finetune_phi2_lora import RecoveryConfig, attach_lora, finalize_saved_recovery, load_recovery, run_recovery, validate_config
 from phi2_precision import merge_lora_with_precision_audit
 from phi2_data import file_sha256
-from prepare_phi2_data import prepare
+from test_phi2_contract import prepare
 from prune_phi2_hesso_cric import PruningConfig, run, train_cric
 from only_train_once import OTO
 

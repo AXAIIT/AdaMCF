@@ -11,6 +11,14 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+
+# 单独运行或 unittest discover 时，生产模块统一从模型目录导入。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PHI2_DIR = PROJECT_ROOT / 'test' / 'pretrain_phi2'
+for directory in (PROJECT_ROOT, PHI2_DIR):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
 import torch
 from torch import nn
 
@@ -25,7 +33,7 @@ from only_train_once.operation.operator import COMPOSED_MODULES, PhiAttentionOTO
 class PhiFrameworkTests(unittest.TestCase):
     def test_export_only_cli_reuses_sparse_checkpoint_and_refuses_overwrite(self):
         from prune_phi2_hesso_cric import main
-        from verify_phi2_pruning import verify
+        from prune_phi2_hesso_cric import verify
         model, plan = zeroed_model_and_plan()
         tokens = torch.arange(8).reshape(1,-1)
         batch = {'input_ids':tokens, 'labels':tokens}
@@ -46,7 +54,8 @@ class PhiFrameworkTests(unittest.TestCase):
                 probe = torch.load(run/'equivalence_probe.pt',weights_only=True)
                 if fmt=='onnx':
                     torch.testing.assert_close(torch.from_numpy(loaded(tokens)),probe['compressed_logits'],atol=1e-5,rtol=1e-4)
-                    verify(SimpleNamespace(run_dir=run,device='cpu'))
+                    with patch('sys.argv',['prune','--verify-only','--output',str(run),'--device','cpu']):
+                        main()
                     self.assertTrue(json.loads((run/'independent_verification.json').read_text())['inference_only'])
                 else:
                     loaded.eval()
