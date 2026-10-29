@@ -73,13 +73,18 @@ def run(args):
               '--data-dir',str(args.data_dir),'--model-dir',str(args.model_dir),
               '--config',str(args.config),'--device','cuda:0']
         execute('profile',[*base,'--output',str(args.output/'profile'),'--profile-only'])
-        execute('training',[*base,'--output',str(args.output/'training')])
+        # 训练统一走人类可读的两阶段总入口；profile 继续使用底层剪枝资源探测。
+        training_command=[args.pruning_python,'-u',str(HERE/'pretrain_phi2_pruning.py'),
+                          '--data-dir',str(args.data_dir),'--model-dir',str(args.model_dir),
+                          '--config',str(args.config),'--device','cuda:0',
+                          '--output',str(args.output/'training')]
+        execute('training',training_command)
         training=args.output/'training'
-        for stage,model in [('evaluation_pruned',training/'compressed_model'),
-                            ('evaluation_recovered',training/'lora_recovery/recovered_model')]:
+        for stage,model in [('evaluation_pruned',training/'stage1_pruning/compressed_model'),
+                            ('evaluation_recovered',training/'stage2_finetuning/recovered_model')]:
             execute(stage,[args.evaluation_python,'-u',str(HERE/'evaluate_phi2_benchmarks.py'),
                     '--model-dir',str(model),'--output',str(args.output/stage),'--device','cuda:0'])
-        pruning=json.loads((training/'pruning_result.json').read_text())
+        pruning=json.loads((training/'stage1_pruning/pruning_result.json').read_text())
         results={stage:json.loads((args.output/stage/'summary.json').read_text())
                  for stage in ('evaluation_pruned','evaluation_recovered')}
         if not all(item['full_seven_task_evaluation'] for item in results.values()):raise AssertionError('七任务评测不完整。')

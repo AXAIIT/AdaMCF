@@ -196,16 +196,21 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
     raise RuntimeError('达到步数保护上限，CRIC 未完成；不生成成功的压缩结果。')
 
 
-def run(args):
-    """阶段一全梯度剪枝；压缩重载后才进入独立 LoRA 阶段，不执行七任务评测。"""
-    config = PruningConfig(**json.loads(args.config.read_text(encoding='utf-8')))
-    if getattr(args,'export_format',None) is not None:
-        config.export_format=args.export_format
+def validate_pruning_config(config):
+    """共享入口检查，不在两阶段总入口复制参数校验规则。"""
     if config.export_format not in ('pt','torch','onnx','safetensors'):
         raise ValueError('导出格式必须为 pt/torch、onnx 或 safetensors。')
     if (config.batch_size < 1 or config.alpha_eval_batches < 1 or config.alpha_batch_size < 0 or config.log_every < 1
             or config.post_pruning_steps < 0 or config.warmup_steps < 0):
         raise ValueError('批量和日志间隔必须为正，预热和剪后尾段步数不能为负。')
+
+
+def run(args):
+    """阶段一全梯度剪枝；压缩重载后才进入独立 LoRA 阶段，不执行七任务评测。"""
+    config = PruningConfig(**json.loads(args.config.read_text(encoding='utf-8')))
+    if getattr(args,'export_format',None) is not None:
+        config.export_format=args.export_format
+    validate_pruning_config(config)
     from finetune_phi2_lora import RecoveryConfig, require_peft, validate_config
     recovery_config = RecoveryConfig(**config.recovery)
     validate_config(recovery_config)

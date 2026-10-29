@@ -3,6 +3,8 @@
 当前实验按用户 2026-10-29 最新要求：仅使用本框架与表格七个数据集，train 用于剪枝/恢复，官方 validation/test 仅评测；不用原版优化器，不用 Alpaca。文献表格只作外部参考。
 当前运行入口与数据配方见 `docs/phi2-seven-task-run-20261029.md`。下方旧 Alpaca 命令保留为历史功能验证说明，不是本轮实验命令。
 
+两阶段训练建议从 **`pretrain_phi2_pruning.py` 的 `main()`** 开始阅读。它按 BERT 主流程的顺序组织配置、数据、阶段一、压缩检查、阶段二和汇总；训练循环分别复用原剪枝和微调模块。使用方法与新输出布局见 `docs/phi2-two-stage-entrypoint-20261029.md`。
+
 目录位置：`/zeng/GY/OTOv2_v2/test/pretrain_phi2`。
 
 沿用 BERT/VGG 的模型和剪枝产物布局。数据预处理、结构适配、训练与独立验收分别实现；剪枝使用既有个人环境，七任务预处理/评测使用隔离 venv 的固定版官方 lm-eval。
@@ -33,12 +35,16 @@ pretrain_phi2/
 
 | 文件 | 职责 |
 | --- | --- |
+| `pretrain_phi2_pruning.py` | 人类可读的两阶段总入口：CRIC → 物理压缩/重载 → 冻结基座/LoRA → 评估汇总 |
+| `finetune_phi2_lora.py` | 独立 LoRA 微调、基座冻结检查、adapter 保存与合并导出 |
+| `prepare_phi2_benchmark_data.py` | 本轮七任务官方 train 的独立预处理与角色冻结 |
 | `prepare_phi2_data.py` | 固定互斥 train/alpha/eval 原始行索引，分词，保存 JSONL 与摘要 |
 | `phi2_data.py` | 校验和读取冻结数据、padding、生成模型输入 |
 | `phi2_precision.py` | 原生 FP32 漂移记录和严格 FP64 结构对照，诊断后恢复原生实现 |
 | `prune_phi2_hesso_cric.py` | 运行完整 CRIC 并调用框架导出；--export-only 从已有稀疏检查点独立导出与审计 |
 | `verify_phi2_pruning.py` | 新进程重载，检查参数量、logits、缓存生成和反向传播 |
 | `test_phi2_contract.py` | 随机小模型结构、数据隔离和输出保护测试 |
+| `test_phi2_entrypoint.py` | 新总入口的四模式/三格式、新旧权重一致、失败保护与控制器路由 |
 | `phi2_smoke_config.json` | 可读的功能验收配置，可另存为独立实验配置 |
 
 ## 已准备的共享数据（2026-10-27）
