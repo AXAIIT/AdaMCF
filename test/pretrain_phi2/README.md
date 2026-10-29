@@ -200,8 +200,8 @@ ONNX：`session = OTO.load_subnet(package, device="cpu")`，`logits = session(in
 
 终端与 run.log 同步输出阶段信息，events.jsonl 保存结构事件，training_trace.jsonl 保存每步记录。
 新数据预处理过滤空响应并保存 prepare.log；不会重写已有 proof_v1 数据。
-evaluation_protocol.json 是七任务评测的审查提案，不是已经可执行的评测器，也不代表任务实验已开始。
-正式实验前需冻结长度/截断、训练与 α 池、LoRA 配方、评测实现和指标口径；见框架 docs 的协议审查文档。
+evaluation_protocol.json 已由 evaluate_phi2_benchmarks.py 执行，固定七任务本地文件与官方模板。
+本轮冻结数据、训练与 α 池、LoRA 配方和评测口径见 docs/phi2-seven-task-run-20261029.md；实际进度以运行结果为准。
 
 后续来源审查与只读长度统计见 `docs/phi2-data-lora-reference-review-20261028.md`：
 官方 Alpaca 模板下，当前有效数据最长 1044 tokens，2048 上限可完整保留；
@@ -247,11 +247,21 @@ model = load_recovery("runs/my_two_stage/lora_recovery", device="cpu")
 ```
 
 workflow_result.json 记录两阶段结果；单独剪枝成功不再使等待恢复的总体任务标记为完成。阶段二失败时保留阶段一结果及独立失败日志。
-本次仅在小型 Phi 上完成四类剪枝模式、三格式和真实 LoRA 的 CPU 回归；未启动真实 Phi-2 正式恢复或七任务评测。
+小型 Phi 的 CPU 回归覆盖四类剪枝模式、三格式和真实 LoRA；完整 Phi-2 的测量另见运行目录，不能由 CPU 测试推断。
+
+若训练已完成而合并/导出失败，可校验保存的 adapter 和完整训练轨迹后只重做导出：
+
+```bash
+$P finetune_phi2_lora.py --finalize-only runs/my_two_stage/lora_recovery --export-format safetensors
+```
+
+该入口不重训、不修改 adapter、不覆盖已有 recovered_model；原 failure.json 保留。
+merge_precision_audit.json 分开记录严格 FP64 合并公式验证及实际 FP32 误差。FP64 只用于诊断，训练与最终权重仍是 FP32。
+合并前后矩阵乘法的求和顺序不同，不保证 FP32 每个 logit 都满足旧 2e-4 门槛；该门槛是否通过照实记录，不改写为通过。
 
 ## 正式实验的数据一致性
 
 Alpaca-only 仍只用于功能验证，不能称为论文实验数据已对齐。公开证据链为 HESSO-CRIC 参考 LoRAShear，后者列出了 OpenWebText、2022 Wikipedia、Gutenberg、BookCorpus，以及指令恢复用 Alpaca。
 当前未找到作者的 Phi-2 精确语料子集/混合比例/样本索引；四类预训练语料也未在当前共享数据清单中发现。WikiText 不能替代 2022 Wikipedia，BookCorpusOpen 不能静默替代 BookCorpus。
-corpus_alignment.json 明确记录已确认来源、当前文件摘要和待核实项，formal_alignment_complete=false；正式预处理/训练继续等待数据对齐，已有 proof 与任务 split 不改。
+corpus_alignment.json 保留来源证据与 formal_alignment_complete=false：作者精确样本仍未知。本轮依用户决定，仅使用七项任务官方 train 训练/α/内部验证，官方 validation/test 仅最终评测；不再等待作者清单，不使用 Alpaca 或上述额外语料。
 详细公共策略与数据审查见 `docs/shared-alpha-and-corpus-alignment-20261028.md`。

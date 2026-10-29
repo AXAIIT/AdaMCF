@@ -10,6 +10,7 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.utils.data import DataLoader
@@ -21,7 +22,8 @@ from transformers import PreTrainedTokenizerFast
 from test_phi2_contract import tiny_model
 from phi2_data import collate_alpha_examples
 from only_train_once.optimizer.alpha_data import AlphaBatch
-from finetune_phi2_lora import RecoveryConfig, attach_lora, load_recovery, run_recovery, validate_config
+from finetune_phi2_lora import RecoveryConfig, attach_lora, finalize_saved_recovery, load_recovery, run_recovery, validate_config
+from phi2_precision import merge_lora_with_precision_audit
 from phi2_data import file_sha256
 from prepare_phi2_data import prepare
 from prune_phi2_hesso_cric import PruningConfig, run, train_cric
@@ -75,6 +77,28 @@ class PhiTrainingTests(unittest.TestCase):
         self.assertTrue(all('lora_A' in name or 'lora_B' in name for name,p in trainable))
         self.assertEqual({id(p) for _,p in trainable},{id(p) for p in model.parameters() if p.requires_grad})
 
+    def test_merge_audit_checks_nonzero_adapters_and_rejects_corruption(self):
+        def adapted():
+            model,trainable=attach_lora(tiny_model(),RecoveryConfig(rank=2,dropout=0))
+            with torch.no_grad():
+                for name,p in trainable:
+                    if 'lora_B' in name:p.normal_(std=.01)
+            return model.eval()
+        ids=torch.arange(6).reshape(1,-1)
+        probes=[{'input_ids':ids,'attention_mask':torch.ones_like(ids)}]
+        model=adapted()
+        merged,audit,outputs=merge_lora_with_precision_audit(model,probes)
+        self.assertTrue(audit['merge_fp64']['passed'])
+        self.assertTrue(all(p.dtype==torch.float32 for p in merged.parameters()))
+        self.assertEqual(outputs[0].shape[:2],ids.shape)
+        model=adapted();kind=type(model.base_model);original=kind.merge_and_unload
+        def corrupt(owner,*args,**kwargs):
+            result=original(owner,*args,**kwargs)
+            with torch.no_grad():result.model.layers[0].mlp.fc2.weight[0,0]+=.1
+            return result
+        with patch.object(kind,'merge_and_unload',corrupt),self.assertRaises(AssertionError):
+            merge_lora_with_precision_audit(model,probes)
+
     def test_invalid_lora_recipe_and_onnx_base_fail_before_creating_output(self):
         for overrides in ({'rank':0},{'steps':0},{'target_modules':['lm_head']},{'dropout':1.},
                           {'learning_rate':float('nan')},{'warmup_steps':100}):
@@ -126,6 +150,30 @@ class PhiTrainingTests(unittest.TestCase):
                     torch.testing.assert_close(actual,probe['logits'],atol=2e-4,rtol=2e-4)
                     bindings=json.loads((output/'lora_recovery/recovery_manifest.json').read_text())
                     self.assertEqual(bindings['base_files'],{p.name:file_sha256(p) for p in (output/'compressed_model').iterdir() if p.is_file()})
+                    self.assertTrue(recovery['merge_precision_audit']['merge_fp64']['passed'])
+                    if mode=='ffn':
+                        # 导出失败后复用已保存训练结果，不创建优化器、不重训、不改 adapter。
+                        retry=output/'saved_adapter_retry'
+                        shutil.copytree(output/'lora_recovery',retry,ignore=shutil.ignore_patterns(
+                            'recovered_model','recovery_result.json','recovery_probe.pt','merge_precision_audit.json'))
+                        adapter_hash=file_sha256(retry/'adapter/adapter_model.safetensors')
+                        with patch('torch.optim.AdamW',side_effect=AssertionError('禁止重训')):
+                            finalized=finalize_saved_recovery(retry,'pt')
+                        self.assertTrue(finalized['finalized_from_saved_adapter'])
+                        self.assertEqual(file_sha256(retry/'adapter/adapter_model.safetensors'),adapter_hash)
+                        with self.assertRaises(FileExistsError):finalize_saved_recovery(retry,'pt')
+                        # 缺少新式 training_result 时，旧完整轨迹也能恢复；不完整轨迹必须拒绝。
+                        legacy=output/'legacy_saved_adapter'
+                        shutil.copytree(retry,legacy,ignore=shutil.ignore_patterns(
+                            'recovered_model','recovery_result.json','recovery_probe.pt','merge_precision_audit.json','training_result.json'))
+                        with patch('torch.optim.AdamW',side_effect=AssertionError('禁止重训')):
+                            finalized=finalize_saved_recovery(legacy,'pt')
+                        self.assertEqual(finalized['training_metadata_source'],'legacy_trace_and_events')
+                        broken=output/'incomplete_adapter'
+                        shutil.copytree(legacy,broken,ignore=shutil.ignore_patterns('recovered_model','recovery_result.json'))
+                        (broken/'finetuning_trace.jsonl').write_text('',encoding='utf-8')
+                        with self.assertRaisesRegex(ValueError,'训练不完整'):finalize_saved_recovery(broken,'pt')
+                        self.assertFalse((broken/'recovered_model').exists())
                     # 若指定 ONNX，阶段一仍保留可训练中间包，最终恢复模型输出 ONNX。
                     if fmt=='onnx':
                         self.assertTrue((output/'compressed_model/model.safetensors').is_file())

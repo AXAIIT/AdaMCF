@@ -1,7 +1,7 @@
 """第二阶段：重载物理压缩的 Phi，只训练 LoRA A/B，保存适配器和合并模型。
 
 数据必须先由独立预处理脚本冻结。本文件不剪枝、不更新 α、不训练基座，
-也不把 Alpaca 响应 NLL 当作七任务准确率。可由剪枝入口调用或单独运行。
+也不把内部响应 NLL 当作七任务准确率。可由剪枝入口调用或单独运行。
 """
 import argparse
 from dataclasses import asdict, dataclass, field
@@ -124,6 +124,90 @@ def load_recovery(directory, device='cpu', base_dir=None):
     return PeftModel.from_pretrained(base,directory/'adapter',is_trainable=False,local_files_only=True).eval()
 
 
+def export_recovered_model(model, tokenizer, architecture, output, export_format, dataset, pad_token_id):
+    """只合并与导出，不做梯度更新；供训练尾部和断点导出共用。"""
+    from phi2_precision import merge_lora_with_precision_audit
+    from prune_phi2_hesso_cric import write_json
+    indices = sorted({0,len(dataset)//3,2*len(dataset)//3})
+    probes = [collate_examples([dataset[i]],pad_token_id) for i in indices]
+    model = model.cpu().eval()
+    merged,audit,logits = merge_lora_with_precision_audit(model,probes)
+    audit['internal_eval_row_ids'] = [dataset[i]['row_id'] for i in indices]
+    write_json(output/'merge_precision_audit.json',audit)
+    save_pruned_package(merged,tokenizer,architecture,output/'recovered_model',weights_format=export_format)
+    torch.save({'batch':probes[0],'logits':logits[0]},output/'recovery_probe.pt')
+    del merged,model;gc.collect()
+    loaded=OTO.load_subnet(output/'recovered_model',device='cpu')
+    reload_errors=[]
+    for probe,reference in zip(probes,logits):
+        if export_format=='onnx':
+            actual=torch.from_numpy(loaded(probe['input_ids'],probe['attention_mask']))
+            torch.testing.assert_close(actual,reference,atol=1e-3,rtol=1e-3)
+        else:
+            loaded.eval()
+            with torch.no_grad():actual=loaded(**probe,use_cache=False).logits
+            torch.testing.assert_close(actual,reference,atol=1e-5,rtol=1e-4)
+        reload_errors.append(float((actual-reference).abs().max()))
+    return {'recovered_package':str(output/'recovered_model'),'merged_reload_verified':True,
+            'reload_logits_max_abs_error':max(reload_errors),'merge_precision_audit':audit}
+
+
+def finalize_saved_recovery(directory, export_format='safetensors'):
+    """从已完成训练的 adapter 续做导出，拒绝覆盖，保留原失败记录。
+
+    先校验基座/adapter/数据摘要与完整训练轨迹。旧运行没有独立训练结果
+    文件时，只接受有冻结基座检查和完成事件的日志，不把半途训练当完成。
+    """
+    from prune_phi2_hesso_cric import write_json,log_stage
+    directory=Path(directory)
+    if (directory/'recovered_model').exists() or (directory/'recovery_result.json').exists():
+        raise FileExistsError('恢复模型或完成结果已存在，拒绝重复导出。')
+    bindings=json.loads((directory/'recovery_manifest.json').read_text(encoding='utf-8'))
+    data=Path(bindings['data_dir']);manifest=load_manifest(data)
+    if file_sha256(data/'manifest.json') != bindings['data_manifest_sha256']:
+        raise ValueError('LoRA 训练数据清单已改变。')
+    trace=[json.loads(line) for line in (directory/'finetuning_trace.jsonl').read_text(encoding='utf-8').splitlines()]
+    steps=bindings['config']['steps']
+    if [row['step'] for row in trace] != list(range(1,steps+1)) or any(row['base_gradients_present'] for row in trace):
+        raise ValueError('LoRA 训练不完整或存在基座梯度，不能继续导出。')
+    result_file=directory/'training_result.json'
+    if result_file.exists():
+        result=json.loads(result_file.read_text(encoding='utf-8'))
+        if (result.get('steps') != steps or not result.get('base_parameters_unchanged')
+                or not result.get('adapter_parameters_changed')
+                or result.get('base_parameter_sha256_before') != bindings['base_parameter_sha256']
+                or result.get('base_parameter_sha256_after') != bindings['base_parameter_sha256']):
+            raise ValueError('独立训练结果与基座绑定或完整步数不一致。')
+    else:
+        events=[json.loads(line) for line in (directory/'events.jsonl').read_text(encoding='utf-8').splitlines()]
+        start=next(row for row in events if row['stage']=='阶段二 2/4 LoRA')
+        end=next(row for row in reversed(events) if row['stage']=='阶段二 3/4 保存')
+        if not end['base_parameters_unchanged'] or not end['adapter_parameters_changed']:
+            raise ValueError('缺少训练完成的基座冻结/adapter 更新证据。')
+        result={'state':'training_completed','lora_recovery_performed':True,'full_benchmark_evaluated':False,
+            'base_parameters_unchanged':True,'adapter_parameters_changed':True,
+            'base_parameter_sha256_before':bindings['base_parameter_sha256'],
+            'base_parameter_sha256_after':bindings['base_parameter_sha256'],
+            'steps':steps,'dtype':'float32','internal_eval_before':start['internal_eval_before'],
+            'internal_eval_after':end['internal_eval_after'],'adapter_package':str(directory/'adapter'),
+            'training_metadata_source':'legacy_trace_and_events'}
+    model=load_recovery(directory)
+    # PEFT 包装插入 base_layer 层级；去掉包装名后与训练前原始参数顺序比较。
+    base_parameters=[(name.replace('.base_layer.','.'),p) for name,p in model.get_base_model().named_parameters()
+                     if not any(part in ('lora_A','lora_B') for part in name.split('.'))]
+    if parameter_fingerprint(base_parameters) != bindings['base_parameter_sha256']:
+        raise ValueError('重载基座与训练前逐参数摘要不一致。')
+    tokenizer=AutoTokenizer.from_pretrained(directory/'adapter',local_files_only=True)
+    architecture=json.loads((Path(bindings['base_package'])/'architecture.json').read_text(encoding='utf-8'))
+    dataset=PreparedDataset(data,'eval',manifest)
+    exported=export_recovered_model(model,tokenizer,architecture,directory,export_format,dataset,manifest['pad_token_id'])
+    result.update(exported,state='completed',export_format=export_format,finalized_from_saved_adapter=True,
+                  adapter_package=str(directory/'adapter'))
+    write_json(directory/'recovery_result.json',result);write_json(directory/'status.json',result)
+    log_stage(directory,'阶段二完成','已从保存的 adapter 完成合并、导出和独立重载；没有重训。',**result)
+    return result
+
+
 def run_recovery(base_dir, data_dir, output, config, device, export_format='safetensors', tokenizer=None):
     from functools import partial
     from prune_phi2_hesso_cric import evaluate_response_loss, log_stage, memory_stats, write_json
@@ -231,29 +315,14 @@ def run_recovery(base_dir, data_dir, output, config, device, export_format='safe
         del optimizer,scheduler,base_parameters,trainable,base
         model=model.cpu().eval();gc.collect()
         if device.type=='cuda':torch.cuda.empty_cache()
-        probe={k:v[:1] for k,v in next(iter(eval_loader)).items()}
-        with torch.no_grad():reference=model(**probe,use_cache=False).logits
-        merged=model.merge_and_unload(safe_merge=True).eval()
-        with torch.no_grad():merged_logits=merged(**probe,use_cache=False).logits
-        torch.testing.assert_close(merged_logits,reference,atol=2e-4,rtol=2e-4)
-        save_pruned_package(merged,tokenizer,architecture,output/'recovered_model',weights_format=export_format)
-        torch.save({'batch':probe,'logits':merged_logits},output/'recovery_probe.pt')
-        del merged,model;gc.collect()
-        loaded=OTO.load_subnet(output/'recovered_model',device='cpu')
-        if export_format=='onnx':
-            actual=torch.from_numpy(loaded(probe['input_ids'],probe['attention_mask']))
-            torch.testing.assert_close(actual,merged_logits,atol=1e-3,rtol=1e-3)
-        else:
-            loaded.eval()
-            with torch.no_grad():actual=loaded(**probe,use_cache=False).logits
-            torch.testing.assert_close(actual,merged_logits,atol=1e-5,rtol=1e-4)
-        result={'state':'completed','lora_recovery_performed':True,'full_benchmark_evaluated':False,
+        result={'state':'training_completed','lora_recovery_performed':True,'full_benchmark_evaluated':False,
                 'base_parameters_unchanged':True,'adapter_parameters_changed':True,
                 'base_parameter_sha256_before':before_hash,'base_parameter_sha256_after':after_hash,
                 'steps':config.steps,'dtype':'float32','internal_eval_before':baseline,'internal_eval_after':recovered_eval,
-                'export_format':export_format,'recovered_package':str(output/'recovered_model'),
-                'adapter_package':str(output/'adapter'),'merged_reload_verified':True,
-                'reload_logits_max_abs_error':float((actual-merged_logits).abs().max())}
+                'export_format':export_format,'adapter_package':str(output/'adapter')}
+        write_json(output/'training_result.json',result)
+        result.update(export_recovered_model(model,tokenizer,architecture,output,export_format,
+                      eval_loader.dataset,manifest['pad_token_id']),state='completed')
         write_json(output/'recovery_result.json',result);write_json(output/'status.json',result)
         log_stage(output,'阶段二完成','adapter、合并模型及独立重载校验完成。',**result)
         return result
@@ -267,13 +336,20 @@ def run_recovery(base_dir, data_dir, output, config, device, export_format='safe
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base-dir',type=Path,required=True)
-    parser.add_argument('--data-dir',type=Path,required=True)
-    parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--base-dir',type=Path)
+    parser.add_argument('--data-dir',type=Path)
+    parser.add_argument('--output',type=Path)
+    parser.add_argument('--finalize-only',type=Path,help='已完成训练的 LoRA 目录；只续做合并导出，不训练。')
     parser.add_argument('--config',type=Path,default=HERE/'phi2_two_stage_smoke_config.json')
     parser.add_argument('--device',default='cuda:0')
     parser.add_argument('--export-format',choices=('pt','safetensors','onnx'),default='safetensors')
     args=parser.parse_args()
+    if args.finalize_only:
+        if args.base_dir or args.data_dir or args.output:parser.error('--finalize-only 不与训练路径同时使用。')
+        torch.set_num_threads(4)
+        finalize_saved_recovery(args.finalize_only,args.export_format)
+        return
+    if not all((args.base_dir,args.data_dir,args.output)):parser.error('训练需要 --base-dir/--data-dir/--output。')
     source=json.loads(args.config.read_text(encoding='utf-8'))
     config=RecoveryConfig(**source.get('recovery',source))
     run_recovery(args.base_dir,args.data_dir,args.output,config,args.device,args.export_format)

@@ -5,6 +5,8 @@
 训练、保存与正常推理仍使用原生 Phi，不修改安装包或公共算子。
 """
 from unittest.mock import patch
+import copy
+import gc
 
 import torch
 from transformers.models.phi import modeling_phi
@@ -50,3 +52,48 @@ def audit_structure_precision(sparse_model, compressed_model, batch, atol=1e-8, 
         sparse_model.float()
         compressed_model.float()
     return {'native_fp32': native, 'structure_fp64': high_precision}, compact_fp32
+
+
+@torch.no_grad()
+def merge_lora_with_precision_audit(model, probes, atol=1e-8, rtol=1e-8):
+    """区分 W·x+B·A·x 与 (W+B·A)·x 的舍入差异和错误合并。
+
+    严格 FP64 对照验证合并公式；实际导出仍由原 FP32 模型执行 PEFT
+    标准合并。FP32 的旧门槛结果、误差和 argmax 一致率照实保存，
+    不把 FP64 通过写成 FP32 逐元素一致。这里只处理 CPU 导出诊断。
+    """
+    if not probes or any(p.device.type != 'cpu' or p.dtype != torch.float32 for p in model.parameters()):
+        raise ValueError('合并审计需要非空探针和 CPU FP32 模型。')
+    inputs = [{k:v for k,v in batch.items() if k != 'labels'} for batch in probes]
+    model.eval()
+    references = [model(**batch,use_cache=False).logits for batch in inputs]
+    high = copy.deepcopy(model).double().eval()
+    try:
+        with patch.object(modeling_phi,'eager_attention_forward',fp64_attention):
+            expected = [high(**batch,use_cache=False).logits for batch in inputs]
+            high = high.merge_and_unload(safe_merge=True).eval()
+            errors = []
+            for batch,reference in zip(inputs,expected):
+                actual = high(**batch,use_cache=False).logits
+                torch.testing.assert_close(actual,reference,atol=atol,rtol=rtol)
+                errors.append(float((actual-reference).abs().max()))
+    finally:
+        del high
+        gc.collect()
+    merged = model.merge_and_unload(safe_merge=True).eval()
+    records, outputs = [], []
+    for batch,reference in zip(inputs,references):
+        actual = merged(**batch,use_cache=False).logits
+        if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():
+            raise FloatingPointError('合并审计出现非有限 FP32 输出。')
+        error = (actual-reference).abs()
+        records.append({'input_shape':list(batch['input_ids'].shape),
+            'max_abs_error':float(error.max()),'mean_abs_error':float(error.mean()),
+            'relative_l2_error':float(error.norm()/reference.norm().clamp_min(1e-12)),
+            'top1_agreement':float((actual.argmax(-1)==reference.argmax(-1)).double().mean()),
+            'strict_fp32_allclose_at_2e_4':bool(torch.allclose(actual,reference,atol=2e-4,rtol=2e-4))})
+        outputs.append(actual)
+    audit = {'native_fp32':records,'merge_fp64':{'passed':True,'atol':atol,'rtol':rtol,
+        'max_abs_error':max(errors),'per_probe_max_abs_error':errors},
+        'export_dtype':'float32','fp32_elementwise_equivalence_claimed':all(r['strict_fp32_allclose_at_2e_4'] for r in records)}
+    return merged,audit,outputs
