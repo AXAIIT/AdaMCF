@@ -1,8 +1,55 @@
 """CRIC 周期边界上的损失引导 α 更新，不改变原 HESSO 调度器。"""
 import math
+from dataclasses import asdict, dataclass, replace
 import torch
-from .alpha_scheduler import LossGuidedAlphaScheduler, advance_alpha, alpha_boundary_confident
-from .alpha_data import select_alpha_batches, commit_alpha_selection
+from .alpha_scheduler import AlphaScheduleConfig, ALPHA_CFG, LossGuidedAlphaScheduler, advance_alpha, alpha_boundary_confident
+from .alpha_data import (CRICAlphaPool, AlphaBatch, AlphaEvaluationPool, _to_device,
+                         select_alpha_batches, commit_alpha_selection)
+
+
+@dataclass
+class CRICAlphaScheduleConfig(AlphaScheduleConfig):
+    """CRIC 独立的取样配置；HESSO 继续使用原 AlphaScheduleConfig。
+
+    数量约束按分层计算。默认不设硬上限，避免无声覆盖百分比；数据太大时
+    调用方可以设置上限，并从日志读取实际比例。微批大小只控制显存。
+    """
+    sampling_policy: str = 'ratio'
+    pool_ratio: float = 0.1
+    update_ratio: float = 0.5
+    align_power_of_two: bool = True
+    min_pool_samples: int = 1
+    max_pool_samples: int | None = None
+    min_update_samples: int = 1
+    max_update_samples: int | None = None
+
+    def __post_init__(self):
+        if self.sampling_policy not in ('ratio', 'legacy'):
+            raise ValueError('CRIC α sampling_policy 必须为 ratio 或 legacy。')
+        for name in ('pool_ratio', 'update_ratio'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not math.isfinite(value) or not 0 < value <= 1:
+                raise ValueError(f'CRIC α {name} 必须在 (0, 1] 内。')
+        if not isinstance(self.align_power_of_two, bool):
+            raise ValueError('CRIC α align_power_of_two 必须为 bool。')
+        for role in ('pool', 'update'):
+            low, high = getattr(self, f'min_{role}_samples'), getattr(self, f'max_{role}_samples')
+            if not isinstance(low,int) or isinstance(low,bool) or low < 1:
+                raise ValueError('CRIC α 样本下限必须为正整数。')
+            if high is not None and (not isinstance(high,int) or isinstance(high,bool) or high < low):
+                raise ValueError('CRIC α 样本上限必须为不低于下限的整数。')
+
+
+def make_cric_alpha_config(value=None, *, checkpoint=False):
+    """新建默认使用百分比；显式旧配置对象/旧检查点保留原渐增策略。"""
+    if isinstance(value, CRICAlphaScheduleConfig):
+        return replace(value)
+    if isinstance(value, AlphaScheduleConfig):
+        return CRICAlphaScheduleConfig(**asdict(value), sampling_policy='legacy')
+    values = asdict(ALPHA_CFG) if value is None else dict(value)
+    if checkpoint and 'sampling_policy' not in values:
+        values['sampling_policy'] = 'legacy'
+    return CRICAlphaScheduleConfig(**values)
 
 
 class CRICAlphaScheduler(LossGuidedAlphaScheduler):
@@ -14,7 +61,12 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
     """
 
     def __init__(self, *args, **kwargs):
+        if len(args) < 4:
+            kwargs['cfg'] = make_cric_alpha_config(kwargs.get('cfg'))
         super().__init__(*args, **kwargs)
+        self.data_pool = None
+        self._pending_pool_state = None
+        self.last_skip_reason = None
         self.update_count = 0
         self._last_update_step = -1
         self._eval_cursor = 0
@@ -34,6 +86,7 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         result.update(update_count=self.update_count,
                       last_update_step=self._last_update_step,
                       eval_cursor=self._eval_cursor)
+        result['data_pool'] = self.data_pool.state_dict() if isinstance(self.data_pool, CRICAlphaPool) else self._pending_pool_state
         return result
 
     def load_state_dict(self, state):
@@ -48,6 +101,15 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         self.update_count = int(state.get('update_count', 0))
         self._last_update_step = int(state.get('last_update_step', -1))
         self._eval_cursor = int(state.get('eval_cursor', 0))
+        self._pending_pool_state = state.get('data_pool')
+
+    def attach_data_pool(self, pool):
+        if self._pending_pool_state is not None:
+            if not isinstance(pool, CRICAlphaPool):
+                raise ValueError('检查点含百分比池状态，恢复时必须提供 CRICAlphaPool。')
+            pool.load_state_dict(self._pending_pool_state)
+            self._pending_pool_state = None
+        self.data_pool = pool
 
     @staticmethod
     def _loss(model, criterion, inputs, targets):
@@ -72,17 +134,24 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         return value.detach().float().reshape(())
 
     @torch.no_grad()
-    def update(self, model, criterion, inputs, targets=None, t_in_period=0):
+    def update(self, model, criterion, inputs=None, targets=None, t_in_period=0):
         backend = self.backend
         if backend is None:
             raise RuntimeError('CRIC α: 尚未绑定优化器。')
+        if inputs is None:
+            inputs = self.data_pool
+        if isinstance(inputs, CRICAlphaPool):
+            self.attach_data_pool(inputs)
         context = backend.alpha_update_context()
+        self.last_skip_reason = None
         if context is None or context['step'] == self._last_update_step:
+            self.last_skip_reason = 'not_boundary' if context is None else 'already_updated'
             return False
         cfg = self.cfg
         self.last_eval_stats = None
         cycle = context['round']
         if cycle < cfg.start_after_period or cycle % max(1, cfg.update_stride):
+            self.last_skip_reason = 'stride_or_start'
             return False
 
         # 只预览下一步梯度变体；不推进 Adam/SGD 动量，真实 step 只更新一次状态。
@@ -91,9 +160,30 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         scores = torch.cat(backend.global_scores).detach()
         k = backend.target_num_redundant_groups
         if alpha_boundary_confident(scores,k,cfg.min_gap_std):
+            self.last_skip_reason = 'confident_boundary'
             return False
 
-        selected = select_alpha_batches(inputs,targets,cycle,cfg,self.device,self._eval_cursor)
+        pool_state = inputs.state_dict() if isinstance(inputs, CRICAlphaPool) else None
+        try:
+            if getattr(cfg, 'sampling_policy', 'legacy') == 'ratio':
+                if isinstance(inputs, CRICAlphaPool):
+                    selected = inputs.take(cfg)
+                    selected = [AlphaBatch(_to_device(b.inputs,self.device), _to_device(b.targets,self.device),
+                                           b.sample_ids,b.supervised_tokens) for b in selected]
+                else:
+                    # 旧模型传批次缓存时只能按批次百分比回退，不能声称精确控制
+                    # 独立样本量。新入口应使用 CRICAlphaPool 的样本级协议。
+                    size = len(inputs) if isinstance(inputs,(AlphaEvaluationPool,list,tuple)) else 1
+                    count = max(1, math.ceil(size * cfg.update_ratio))
+                    fixed = replace(cfg, eval_batch_limit=count, eval_batch_grow_every=1,
+                                    start_after_period=0)
+                    selected = select_alpha_batches(inputs,targets,count-1,fixed,self.device,self._eval_cursor)
+            else:
+                selected = select_alpha_batches(inputs,targets,cycle,cfg,self.device,self._eval_cursor)
+        except BaseException:
+            if pool_state is not None:
+                inputs.load_state_dict(pool_state)
+            raise
         count = len(selected)
         ratio = 0.7 if context['warmup'] else (cfg.eval_drop_ratio or 0.0)
         old_alpha = self.alpha.clone()
@@ -150,8 +240,10 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
             new_alpha,new_m,new_g_ema=advance_alpha(self.alpha,self.m,self.g_ema,gradient,cfg)
             if not torch.isfinite(new_alpha).all():
                 raise ValueError('CRIC α: 更新后的权重不是有限值。')
-        except Exception:
+        except BaseException:
             backend._reaggregate_overall_from_alpha(old_alpha)
+            if pool_state is not None:
+                inputs.load_state_dict(pool_state)
             raise
 
         self.alpha, self.m, self.g_ema = new_alpha, new_m, new_g_ema
@@ -162,4 +254,11 @@ class CRICAlphaScheduler(LossGuidedAlphaScheduler):
         self._last_update_step = context['step']
         self.update_count += 1
         self.last_eval_stats=commit_alpha_selection(inputs,selected)
+        if getattr(cfg, 'sampling_policy', 'legacy') == 'ratio':
+            self.last_eval_stats.update(sampling_policy='ratio',
+                selection_unit='sample' if isinstance(inputs,CRICAlphaPool) else 'microbatch',
+                alpha_gradient=gradient.detach().cpu().tolist(),
+                alpha_delta_l1=float((self.alpha-old_alpha).abs().sum()),
+                alpha_value_changed=not torch.equal(self.alpha,old_alpha),
+                finite_difference_forward_batches=2*len(self.alpha)*count)
         return True

@@ -1,12 +1,11 @@
 """AdaMCF 五准则/α 与 CRIC 的兼容层；原 HESSO 和模型算子保持原样。"""
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import copy
 import math
 import torch
 from torch.optim.optimizer import required
-from .alpha_scheduler import ALPHA_CFG, AlphaScheduleConfig
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
-from .cric_alpha import CRICAlphaScheduler
+from .cric_alpha import CRICAlphaScheduler, make_cric_alpha_config
 from .hesso import HESSO
 from only_train_once.transform import (
     TensorTransform, index_transformation_param_group, pruning_axis,
@@ -94,9 +93,7 @@ class AdaptiveCRICMixin:
                 # 最终重融合只需每周期的未加权分数和/计数，无须保存每步 GPU 副本。
                 group['raw_score_sums'] = {}
                 group['raw_score_counts'] = {}
-        cfg = (replace(ALPHA_CFG) if alpha_scheduler_cfg is None else
-               replace(alpha_scheduler_cfg) if isinstance(alpha_scheduler_cfg, AlphaScheduleConfig)
-               else AlphaScheduleConfig(**alpha_scheduler_cfg))
+        cfg = make_cric_alpha_config(alpha_scheduler_cfg)
         self.alpha_scheduler = CRICAlphaScheduler(
             keys=score_keys, init_weights=[criteria[k] for k in score_keys],
             device=self.device, cfg=cfg)
@@ -125,6 +122,14 @@ class AdaptiveCRICMixin:
 
     def will_update_alpha_on_next_step(self):
         return self.alpha_update_context() is not None
+
+    def prepare_alpha_data(self, train_dataset, **kwargs):
+        """通用数据入口：模型只提供 dataset、collate 和可选的分层标签。"""
+        from .alpha_data import prepare_cric_alpha_data
+        training, pool, info = prepare_cric_alpha_data(
+            train_dataset, config=self.alpha_scheduler.cfg, **kwargs)
+        self.alpha_scheduler.attach_data_pool(pool)
+        return training, pool, info
 
     def will_enter_new_period_on_next_step(self):
         """兼容既有训练循环；这里指 α 的 CRIC 边界，不是 HESSO 预算周期。"""
@@ -354,7 +359,7 @@ class AdaptiveCRICMixin:
         self.adaptive_alpha = extra['adaptive_alpha']
         for name in ('cache_parameters', 'first_moment_grads', 'second_moment_grads'):
             setattr(self, name, {key: value.to(self.device) for key, value in extra[name].items()})
-        self.alpha_scheduler.cfg = AlphaScheduleConfig(**extra['alpha_config'])
+        self.alpha_scheduler.cfg = make_cric_alpha_config(extra['alpha_config'], checkpoint=True)
         self.alpha_scheduler.load_state_dict(extra['alpha_scheduler'])
         self.prunable_param_group_dict = {g['id']: g for g in self.param_groups if g['is_prunable'] and not g['is_auxiliary']}
         self.param_group_ids = list(self.prunable_param_group_dict)

@@ -5,10 +5,12 @@ import unittest
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from only_train_once.optimizer import AlphaBatch, AlphaEvaluationPool
+from only_train_once.optimizer import (AlphaBatch, AlphaEvaluationPool, CRICAlphaPool,
+    CRICAlphaScheduleConfig, prepare_cric_alpha_data)
 from only_train_once.optimizer.alpha_data import select_alpha_batches, commit_alpha_selection
 from only_train_once.optimizer.alpha_scheduler import AlphaScheduleConfig, LossGuidedAlphaScheduler
 from only_train_once.optimizer.cric_alpha import CRICAlphaScheduler
+from only_train_once.optimizer.cric_alpha import make_cric_alpha_config
 
 
 class ToyModel(nn.Module):
@@ -130,6 +132,168 @@ class SharedAlphaTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError,'broken'):scheduler.update(model,broken,pool)
         self.assertTrue(torch.equal(model.weight,before));self.assertTrue(torch.equal(scheduler.alpha,alpha))
         self.assertFalse(pool.used_sample_ids)
+
+
+class CRICRatioTests(unittest.TestCase):
+    @staticmethod
+    def dataset(size):
+        return [(torch.full((4,),float(i)/100), torch.tensor(float(i)/100)) for i in range(size)]
+
+    def test_single_task_fallback_defaults_and_disjoint_holdout(self):
+        rows=self.dataset(1000)
+        training,pool,info=prepare_cric_alpha_data(rows,batch_size=8)
+        self.assertEqual((len(training),len(pool)),(872,128))
+        self.assertFalse(set(training.indices)&set(pool.dataset.indices))
+        self.assertEqual(info['source'],'training_holdout')
+        selected=pool.take(CRICAlphaScheduleConfig())
+        self.assertEqual(sum(len(b.sample_ids) for b in selected),64)
+        self.assertEqual(len(selected),8)
+
+    def test_explicit_multitask_pool_is_preserved_and_two_updates_cover_it(self):
+        rows=self.dataset(448);labels=[f'task{i//64}' for i in range(448)]
+        training,pool,info=prepare_cric_alpha_data(self.dataset(100),alpha_dataset=rows,
+            alpha_groups=labels,batch_size=8)
+        self.assertEqual((len(training),len(pool)),(100,448))
+        self.assertIsNone(info['actual_pool_ratio'])
+        cohorts=[]
+        for _ in range(2):
+            selected=pool.take(CRICAlphaScheduleConfig())
+            ids=[i for b in selected for i in b.sample_ids];cohorts.append(set(ids))
+            self.assertEqual((len(ids),len(set(ids)),len(selected)),(224,224,28))
+            self.assertEqual(set(pool.last_selection['selected_by_group'].values()),{32})
+            commit_alpha_selection(pool,selected)
+        self.assertFalse(cohorts[0]&cohorts[1])
+        self.assertEqual(len(pool.used_sample_ids),448)
+
+    def test_training_fallback_supports_arbitrary_group_counts_and_shared_mode(self):
+        rows=self.dataset(200);groups=['a']*100+['b']*100
+        training,pool,info=prepare_cric_alpha_data(rows,train_groups=groups,holdout=False)
+        self.assertIs(training,rows)
+        self.assertEqual(info['source'],'training_shared')
+        self.assertEqual(info['pool_by_group'],{'a':8,'b':8})
+        self.assertEqual(len(pool),16)
+
+    def test_unaligned_ratio_bounds_and_small_dataset(self):
+        cfg=CRICAlphaScheduleConfig(align_power_of_two=False,pool_ratio=.1,
+            update_ratio=.5,min_update_samples=3,max_update_samples=4)
+        _,pool,_=prepare_cric_alpha_data(self.dataset(101),config=cfg)
+        self.assertEqual(len(pool),11)
+        self.assertEqual(sum(len(b.sample_ids) for b in pool.take(cfg)),4)
+        _,tiny,_=prepare_cric_alpha_data(self.dataset(2))
+        self.assertEqual(len(tiny),1)
+        self.assertEqual(len(tiny.take(cfg)[0].sample_ids),1)
+        with self.assertRaises(ValueError):prepare_cric_alpha_data(self.dataset(1))
+
+    def test_no_duplicates_when_rounding_crosses_an_epoch(self):
+        cfg=CRICAlphaScheduleConfig(align_power_of_two=False,update_ratio=.6)
+        pool=CRICAlphaPool(self.dataset(7),batch_size=3)
+        seen=set()
+        for _ in range(6):
+            ids=[i for b in pool.take(cfg) for i in b.sample_ids]
+            self.assertEqual((len(ids),len(set(ids))),(5,5));seen.update(ids)
+        self.assertEqual(len(seen),7)
+
+    def test_local_rng_determinism_and_checkpoint_roundtrip(self):
+        before=torch.get_rng_state().clone()
+        pools=[CRICAlphaPool(self.dataset(13),batch_size=3,seed=51) for _ in range(2)]
+        cfg=CRICAlphaScheduleConfig(align_power_of_two=False)
+        first=pools[0].take(cfg);commit_alpha_selection(pools[0],first)
+        pools[1].load_state_dict(pools[0].state_dict())
+        self.assertEqual([b.sample_ids for b in pools[0].take(cfg)],
+                         [b.sample_ids for b in pools[1].take(cfg)])
+        self.assertEqual(pools[0].used_sample_ids,pools[1].used_sample_ids)
+        self.assertTrue(torch.equal(before,torch.get_rng_state()))
+
+    def test_ratio_scheduler_uses_same_samples_for_every_probe_and_restores_on_error(self):
+        model=ToyModel();backend=Backend(model)
+        cfg=CRICAlphaScheduleConfig(min_gap_std=1e9,align_power_of_two=False)
+        scheduler=CRICAlphaScheduler(['a','b'],device='cpu',cfg=cfg);scheduler.attach_backend(backend)
+        pool=CRICAlphaPool(self.dataset(12),batch_size=2)
+        snapshot=pool.state_dict();weight=model.weight.detach().clone()
+        def broken(*_):raise TypeError('ratio probe failed')
+        with self.assertRaises(TypeError):scheduler.update(model,broken,pool)
+        self.assertEqual(pool.cursors,snapshot['cursors'])
+        self.assertEqual(pool.orders,snapshot['orders']);self.assertFalse(pool.used_sample_ids)
+        self.assertTrue(torch.equal(weight,model.weight));model.seen=[]
+        scheduler.update(model,nn.MSELoss(),pool)
+        stats=scheduler.last_eval_stats
+        self.assertEqual((stats['selected_samples'],stats['microbatches']),(6,3))
+        self.assertEqual(len(model.seen),12)
+        for index,item in enumerate(model.seen):self.assertTrue(torch.equal(item,model.seen[index%3]))
+
+    def test_collate_failure_rolls_back_sampling_cursor(self):
+        def broken(_):raise ValueError('collate failed')
+        pool=CRICAlphaPool(self.dataset(8),collate_fn=broken)
+        snapshot=pool.state_dict();model=ToyModel();backend=Backend(model)
+        scheduler=CRICAlphaScheduler(['a','b'],device='cpu',cfg=CRICAlphaScheduleConfig(min_gap_std=1e9))
+        scheduler.attach_backend(backend)
+        with self.assertRaisesRegex(ValueError,'collate failed'):
+            scheduler.update(model,nn.MSELoss(),pool)
+        self.assertEqual(pool.cursors,snapshot['cursors'])
+
+    def test_invalid_configuration_and_legacy_checkpoint_policy(self):
+        for values in ({'pool_ratio':0},{'update_ratio':1.1},{'update_ratio':float('nan')},
+                       {'min_update_samples':0},{'max_pool_samples':0},{'align_power_of_two':1}):
+            with self.subTest(values=values),self.assertRaises(ValueError):CRICAlphaScheduleConfig(**values)
+        self.assertEqual(make_cric_alpha_config().sampling_policy,'ratio')
+        self.assertEqual(make_cric_alpha_config(AlphaScheduleConfig()).sampling_policy,'legacy')
+        self.assertEqual(make_cric_alpha_config({'lr':.02},checkpoint=True).sampling_policy,'legacy')
+        with self.assertRaises(ValueError):
+            CRICAlphaPool(self.dataset(10),groups=['a'])
+
+    def test_scheduler_checkpoint_restores_attached_pool_before_next_update(self):
+        cfg=CRICAlphaScheduleConfig(min_gap_std=1e9,align_power_of_two=False)
+        def setup():
+            model=ToyModel();backend=Backend(model)
+            scheduler=CRICAlphaScheduler(['a','b'],device='cpu',cfg=cfg);scheduler.attach_backend(backend)
+            return model,backend,scheduler,CRICAlphaPool(self.dataset(12),batch_size=2)
+        left,lb,ls,lp=setup();ls.update(left,nn.MSELoss(),lp);saved=ls.state_dict()
+        right,rb,rs,rp=setup();rs.load_state_dict(saved)
+        lb.num_steps=rb.num_steps=3
+        ls.update(left,nn.MSELoss(),lp);rs.update(right,nn.MSELoss(),rp)
+        self.assertEqual(ls.last_eval_stats,rs.last_eval_stats)
+        self.assertTrue(torch.equal(ls.alpha,rs.alpha))
+
+    def test_ratio_pool_gap_skip_does_not_consume_rows(self):
+        model=ToyModel();backend=Backend(model)
+        backend.bank=torch.tensor([[0.,0.],[10.,10.],[20.,20.],[30.,30.]])
+        scheduler=CRICAlphaScheduler(['a','b'],device='cpu',cfg=CRICAlphaScheduleConfig(min_gap_std=0))
+        scheduler.attach_backend(backend);pool=CRICAlphaPool(self.dataset(12))
+        snapshot=pool.state_dict()
+        self.assertFalse(scheduler.update(model,nn.MSELoss(),pool))
+        self.assertEqual(pool.cursors,snapshot['cursors'])
+        self.assertEqual(scheduler.last_skip_reason,'confident_boundary')
+
+    def test_invalid_pool_restore_and_legacy_source_are_explicit(self):
+        pool=CRICAlphaPool(self.dataset(12),batch_size=2)
+        with self.assertRaises(ValueError):
+            CRICAlphaPool(self.dataset(12),batch_size=3).load_state_dict(pool.state_dict())
+        with self.assertRaises(ValueError):
+            CRICAlphaPool(self.dataset(2),groups=[1,'1'])
+        with self.assertRaises(ValueError):
+            prepare_cric_alpha_data(self.dataset(12),config={'sampling_policy':'legacy'})
+
+    def test_real_optimizer_checkpoint_keeps_ratio_config_and_pool_progress(self):
+        from test_adamcf_cric import network, batch
+        inputs,targets=batch();rows=list(zip(inputs,targets));criterion=nn.CrossEntropyLoss()
+        def setup():
+            model,opt=network(variant='adamw')
+            _,pool,_=opt.prepare_alpha_data(rows,alpha_dataset=rows,batch_size=2,seed=51)
+            return model,opt,pool
+        def advance(model,opt,count):
+            for _ in range(count):
+                opt.zero_grad();loss=criterion(model(inputs),targets);loss.backward()
+                if opt.will_update_alpha_on_next_step():opt.alpha_scheduler.update(model,criterion)
+                opt.step(loss.detach())
+        left,lo,lp=setup();advance(left,lo,2)
+        model_state=copy.deepcopy(left.state_dict());state=copy.deepcopy(lo.state_dict())
+        right,ro,rp=setup();right.load_state_dict(model_state);ro.load_state_dict(state)
+        advance(left,lo,18);advance(right,ro,18)
+        self.assertEqual(ro.alpha_scheduler.cfg.update_ratio,.5)
+        self.assertEqual(ro.alpha_scheduler.cfg.sampling_policy,'ratio')
+        for key,value in left.state_dict().items():self.assertTrue(torch.equal(value,right.state_dict()[key]))
+        self.assertEqual(lp.used_sample_ids,rp.used_sample_ids)
+        self.assertTrue(torch.equal(lo.alpha_scheduler.alpha,ro.alpha_scheduler.alpha))
 
 
 if __name__=='__main__':unittest.main()

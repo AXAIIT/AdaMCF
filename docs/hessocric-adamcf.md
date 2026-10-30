@@ -23,15 +23,30 @@ score(g) = Σ_j α_final[j] × (Σ_t normalized_raw[j,g,t] / N)
 
 ## 调用方式
 
-`oto` 应已使用正确的模型和输入构图，参数组的剪枝合同须先验证。下面展示 Hugging Face 风格的训练循环；`alpha_batches` 是固定评估微批列表，所有 Tensor 已放在模型设备上，每项为 `(inputs_dict, None)`，字典内包含 `labels`。
+`oto` 应已使用正确的模型和输入构图，参数组的剪枝合同须先验证。
+2026-10-30 起，CRIC 默认使用以下与模型无关的样本百分比策略。
 
 ```python
 optimizer = oto.hessocric(
     variant='adamw', lr=2e-5, target_group_sparsity=0.2,
     start_cric_step=100, max_cycle_period=10,
     sampling_steps=50, hybrid_training_steps=1000,
-    alpha_scheduler_cfg={'warmup_updates': 0},
+    alpha_scheduler_cfg={'warmup_updates': 0, 'pool_ratio': 0.1, 'update_ratio': 0.5},
 )
+
+# 显式池优先；传 None 时从训练数据构建回退池。
+# groups 是调用方提供的任务/类别标签；单任务可以不提供。
+gradient_data, alpha_pool, pool_info = optimizer.prepare_alpha_data(
+    training_dataset,
+    alpha_dataset=independent_alpha_dataset,  # 没有独立 α 数据时传 None
+    batch_size=8,
+    collate_fn=alpha_collate,                 # 返回 AlphaBatch 或 (inputs, targets)
+    train_groups=training_group_labels,       # 可选，长度必须与 dataset 一致
+    alpha_groups=alpha_group_labels,          # 可选，显式 α dataset 的分层
+    seed=43,
+    holdout=True,                            # 回退池从梯度训练数据中移除
+)
+train_loader = DataLoader(gradient_data, batch_size=train_batch_size, collate_fn=train_collate)
 
 for batch in train_loader:
     # batch 为已经搬到模型设备的字典，包含 input_ids、labels 等。
@@ -39,11 +54,41 @@ for batch in train_loader:
     loss = model(**batch).loss
     loss.backward()
     if optimizer.will_update_alpha_on_next_step():
-        optimizer.alpha_scheduler.update(model, None, alpha_batches)
+        optimizer.alpha_scheduler.update(model, None)  # 使用已绑定的 alpha_pool
     optimizer.step(loss=loss.detach())
 ```
 
-也可直接从 `only_train_once.optimizer` 导入 `HESSOCRIC`，传入现有框架生成的参数组。普通分类模型传 `criterion` 和 `[(inputs, targets), ...]`；单个微批可使用 `update(model, criterion, inputs, targets)`。多输入模型使用字典或把多输入 tuple 放在微批的 `inputs` 位置。
+`alpha_collate` 对字典模型可返回 `AlphaBatch(inputs_dict, sample_ids=...)`；普通分类模型
+返回 `(inputs, targets)`，调用 update 时传入分类 criterion。None criterion 使用模型输出 loss。
+不同模型仅提供数据、collate 和分层元信息，取样决策不写在模型训练脚本内。
+
+也可直接导入 `prepare_cric_alpha_data` 在创建优化器前准备数据；返回相同三元组。
+`holdout=False` 显式选择共享训练样本模式，不将该池称为独立验证数据。
+显式 α 数据不再按 pool_ratio 缩减，调用方负责保证与最终测试数据隔离。
+
+### 百分比、取整和兼容
+
+- 默认 `sampling_policy='ratio'`、`pool_ratio=0.1`、`update_ratio=0.5`、
+  `align_power_of_two=True`。按每个分层计算百分比，先向上取整，再按绝对距离
+  就近对齐到 2 的次幂（等距向上）；不能超出可用样本。对齐后实际比例可能变化。
+- `min_pool_samples/max_pool_samples/min_update_samples/max_update_samples` 是**每层**
+  样本上下限，默认最小 1、最大 None，不用隐含上限覆盖用户比例；可显式限制大数据成本。
+  独立划出模式每层至少保留一条梯度训练样本，小到无法同时分配的层明确报错。
+- 无分层标签自然退化为单任务；不同任务数据量不等时按各层自己的比例抽取，
+  不自动改成任务等权目标。七任务各 64 条只是示例，不是框架约束。
+- 单次评估内无重复，跨边界先遍历未见样本、耗尽后重新打乱；所有正负差分共享同一批数据。
+  局部 RNG 不扰动训练 RNG。失败会恢复池游标/RNG，成功后才提交覆盖记录。
+- GPU `batch_size` 与样本总量独立；ratio 模式忽略旧 `eval_batch_limit` 的渐增截断。
+  旧批次缓存仍可使用，ratio 此时只能按**批次数**比例回退，并在统计中明确单位，
+  无法承诺精确独立样本比例。新代码应使用 `CRICAlphaPool`。
+- `sampling_policy='legacy'` 保留既有渐增微批规则，配合旧缓存/AlphaEvaluationPool；
+  显式传入旧 AlphaScheduleConfig 对象、恢复不含新字段的旧优化器检查点也采用 legacy。
+  HESSO 的配置、数值内核、旧取批入口不变。CRIC 的更新时间、置信门限、
+  损失汇总、历史最终重融合也不在本次改动中调整。
+
+例：七层各 64 条的显式池，每次 50% 是各 32 条，总计 224；微批 8 时共 28 批。
+两个实际成功评估覆盖完整 448 条；排序间隔门限可能跳过边界，日志需要区别
+“可更新边界”“执行差分”和“α 数值实际改变”。不保证增加数据就提高最终精度。
 
 `sampling_steps`、`hybrid_training_steps` 必须显式设置为正整数；`start_cric_step=0` 解释为第一步开始。CRIC 投影阶段必须向 `step` 传入有限标量 loss；建议整个训练过程统一传入。当前只接受参数位于同一设备的配置。
 
@@ -64,6 +109,11 @@ optimizer.load_state_dict(saved['optimizer'])
 ```
 
 优化器检查点包含 CRIC 阶段、参考权重、违反组集合、未加权历史评分、loss 历史、α/动量/EMA 和基础优化器的一二阶动量。恢复后历史评分强制回到 CPU float32。缺少完整 CRIC 状态或评分项/参数组布局不一致的检查点明确拒绝作为续训检查点加载；模型权重仍可单独加载。
+
+绑定 CRICAlphaPool 后，检查点还保存池内排列、游标、局部 RNG、已覆盖样本和
+百分比配置。恢复时以相同冻结 dataset、索引及微批大小重新 prepare_alpha_data；
+待恢复的池状态会在绑定/下一次评估前加载。框架校验索引分层和微批大小，
+数据内容摘要、训练 loader 的顺序/RNG 仍由训练器一并冻结，不能只保存模型权重。
 
 ## 验证与边界
 

@@ -19,12 +19,31 @@
 
 - 原始模型：`models/phi-2/`，包含完整权重、config 和 tokenizer。
 - 冻结数据：`/adminGroup/datasets_source203/llm_pruning/processed/phi2_seven_task_train_s42_v1`。
-- `phi2_seven_task_config.json`：已用于七任务首轮实验的完整配方。
+- `phi2_seven_task_config.json`：七任务配方；2026-10-30 起 α 默认采用百分比策略，首轮历史运行仍以各自冻结的 inputs.json 为准。
 - `phi2_two_stage_smoke_config.json`：短流程验证配置。四种剪枝模式由同一配置中的 pruning_mode 选择，不再保留四份同类配置。
 - `evaluation_protocol.json`：七任务数据路径、官方划分、样本数与模板版本；`paper_phi2_reference.json`：文献参考值。
 - `corpus_alignment.json`：来源审查历史；当前实验按用户决定使用七任务官方 train，不使用 Alpaca。
 
 只预处理官方 train，冻结互斥 train/alpha/内部 eval；完整官方 validation/test 留给最终评测。预处理脚本拒绝覆盖已有数据。
+
+### CRIC 的 α 取样
+
+公共优化器默认 `pool_ratio=0.1`、`update_ratio=0.5`，支持任意单任务或多任务。
+显式 α 数据集直接作为完整池；没有显式 α 数据时，公共 `prepare_cric_alpha_data`
+按分层训练数据的 10% 构建池，默认从梯度训练中移除选中行，亦可显式选择共享模式。
+数量默认就近对齐到每层的 2 次幂，实际可用数量与任务分层优先，不重复样本补齐。
+
+Phi 现有冻结数据已提供独立 α 池，因此不再次按 10% 缩减。七任务每任务 64 条，
+每次成功评估取各 32 条，即 224 条、batch=8 时 28 个微批；两次未被门限跳过的
+成功更新可以覆盖 448 条。池、数据顺序和历史实验均不重写。
+取样由优化器按层无放回轮换，同次有限差分所有正负扰动使用同一组样本。
+周期边界、置信门限、五准则数值更新与最终 α 历史重融合保持原流程。
+
+配置使用 `alpha_sampling_policy/alpha_pool_ratio/alpha_update_ratio/alpha_align_power_of_two`。
+`alpha_eval_batches` 只在 `legacy` 策略下表示原渐增微批上限；不截断新的样本百分比。
+`stage1_pruning/alpha_pool.json` 保存池索引及摘要，`training_trace.jsonl` 保存各次样本、
+分层用量、覆盖率、差分向量、α 改变量及跳过原因。通用 API 和恢复规则见
+[公共 CRIC 说明](../../docs/hessocric-adamcf.md)。
 
 ## 两阶段训练
 

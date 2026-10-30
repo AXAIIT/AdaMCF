@@ -29,7 +29,7 @@ from only_train_once import OTO
 from phi2_data import PreparedDataset, collate_examples, collate_alpha_examples, file_sha256, load_manifest, to_device
 from only_train_once.model_adapters.phi import group_summary, parameter_count
 from phi2_precision import audit_structure_precision
-from only_train_once.optimizer.alpha_data import AlphaEvaluationPool
+from only_train_once.optimizer import AlphaEvaluationPool, CRICAlphaPool, CRICAlphaScheduleConfig
 
 
 @dataclass
@@ -51,6 +51,10 @@ class PruningConfig:
     post_pruning_steps: int = 4
     adaptive_alpha: bool = True
     alpha_eval_batches: int = 1
+    alpha_sampling_policy: str = 'ratio'
+    alpha_pool_ratio: float = 0.1
+    alpha_update_ratio: float = 0.5
+    alpha_align_power_of_two: bool = True
     alpha_batch_size: int = 0
     alpha_seed: int = 43
     recovery: dict = field(default_factory=dict)
@@ -140,7 +144,22 @@ def phase_name(optimizer):
 def train_cric(model, optimizer, train_loader, alpha_loader, config, output, device):
     """全梯度 CRIC；post_pruning 是本次联合训练的尾段，不是 LoRA 恢复。"""
     # alpha 与 train/eval 是互斥的原始行索引，预处理清单已经核对。
-    alpha_pool = AlphaEvaluationPool(alpha_loader)
+    if isinstance(alpha_loader, CRICAlphaPool):
+        alpha_pool = alpha_loader
+    elif (optimizer.alpha_scheduler.cfg.sampling_policy == 'ratio'
+          and hasattr(alpha_loader, 'dataset')):
+        dataset = alpha_loader.dataset
+        # task 只是数据适配元信息；分层取样、数量与轮换策略由公共优化器决定。
+        labels = [row.get('task', 'all') for row in dataset]
+        _, alpha_pool, pool_info = optimizer.prepare_alpha_data(
+            train_loader.dataset if hasattr(train_loader, 'dataset') else train_loader,
+            alpha_dataset=dataset, alpha_groups=labels,
+            batch_size=alpha_loader.batch_size, collate_fn=alpha_loader.collate_fn,
+            seed=config.alpha_seed)
+        write_json(output / 'alpha_pool.json', pool_info)
+        log_stage(output, 'α 数据', '显式池按样本百分比取数；微批大小只控制显存。', **pool_info)
+    else:
+        alpha_pool = AlphaEvaluationPool(alpha_loader)
     maximum_steps = (optimizer.start_global_sampling_step
                      + config.sampling_steps * config.max_cycle_period
                      + config.hybrid_training_steps + config.post_pruning_steps + 2)
@@ -164,8 +183,10 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
             norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.grad_clip_norm, error_if_nonfinite=True)
             updated = False
+            alpha_attempted = False
             alpha_ids, alpha_tokens, alpha_batch_count = [], 0, 0
             if optimizer.will_update_alpha_on_next_step():
+                alpha_attempted = True
                 updated = optimizer.alpha_scheduler.update(model, None, alpha_pool)
                 if updated:
                     stats=optimizer.alpha_scheduler.last_eval_stats
@@ -181,6 +202,13 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
                       'alpha_row_ids':alpha_ids,'alpha_microbatches':alpha_batch_count,
                       'alpha_supervised_tokens':alpha_tokens,
                       'alpha_unique_samples_seen':len(alpha_pool.used_sample_ids),
+                      'alpha_pool_samples':len(alpha_pool) if isinstance(alpha_pool,CRICAlphaPool) else None,
+                      'alpha_selected_samples':stats.get('selected_samples',len(alpha_ids)) if updated else 0,
+                      'alpha_selected_by_group':stats.get('selected_by_group',{}) if updated else {},
+                      'alpha_actual_update_ratio':stats.get('actual_update_ratio') if updated else None,
+                      'alpha_skip_reason':optimizer.alpha_scheduler.last_skip_reason if alpha_attempted and not updated else None,
+                      'alpha_gradient':stats.get('alpha_gradient') if updated else None,
+                      'alpha_delta_l1':stats.get('alpha_delta_l1') if updated else None,
                       'learning_rate':optimizer.param_groups[0]['lr'],
                       'pruned_logical_groups':sum(len(g.get('pruned_idxes',[])) for g in optimizer.param_groups if g['is_prunable']),
                       'elapsed_seconds': time.perf_counter() - started}
@@ -197,6 +225,9 @@ def train_cric(model, optimizer, train_loader, alpha_loader, config, output, dev
 
 
 def validate_pruning_config(config):
+    CRICAlphaScheduleConfig(sampling_policy=config.alpha_sampling_policy,
+        pool_ratio=config.alpha_pool_ratio, update_ratio=config.alpha_update_ratio,
+        align_power_of_two=config.alpha_align_power_of_two)
     """共享入口检查，不在两阶段总入口复制参数校验规则。"""
     if config.export_format not in ('pt','torch','onnx','safetensors'):
         raise ValueError('导出格式必须为 pt/torch、onnx 或 safetensors。')
@@ -236,7 +267,10 @@ def run(args):
     log_stage(args.output,'1/6 数据','三个角色分别用于梯度更新、α 更新和独立 NLL。',
               split_rows={k:manifest['splits'][k]['rows'] for k in ('train','alpha','eval')},
               max_length=manifest['max_length'],loss_on=manifest['loss_on'],
-              alpha_microbatch_limit=config.alpha_eval_batches,data_manifest_sha256=file_sha256(args.data_dir/'manifest.json'))
+              alpha_sampling_policy=config.alpha_sampling_policy, alpha_pool_ratio=config.alpha_pool_ratio,
+              alpha_update_ratio=config.alpha_update_ratio,
+              alpha_legacy_microbatch_limit=config.alpha_eval_batches if config.alpha_sampling_policy=='legacy' else None,
+              data_manifest_sha256=file_sha256(args.data_dir/'manifest.json'))
     for name, expected_sha256 in manifest['tokenizer_files'].items():
         path = args.model_dir / name
         if not path.is_file() or file_sha256(path) != expected_sha256:
@@ -275,7 +309,8 @@ def run(args):
         str(p.relative_to(framework)): file_sha256(p)
         for p in [framework/'__init__.py', *sorted((framework/'model_adapters').glob('*.py')),
                   framework/'operation/native_phi.py', framework/'optimizer/hesso_cric.py',
-                  framework/'optimizer/cric_adapter.py', framework/'optimizer/cric_alpha.py']}
+                  framework/'optimizer/cric_adapter.py', framework/'optimizer/cric_alpha.py',
+                  framework/'optimizer/alpha_data.py', framework/'optimizer/alpha_scheduler.py']}
     write_json(args.output / 'inputs.json', inputs)
     before_count = parameter_count(model)
     baseline = evaluate_response_loss(model, loaders['eval'], device)
@@ -291,7 +326,9 @@ def run(args):
         sampling_steps=config.sampling_steps, max_cycle_period=config.max_cycle_period,
         hybrid_training_steps=config.hybrid_training_steps,
         adaptive_alpha=config.adaptive_alpha,
-        alpha_scheduler_cfg={'warmup_updates': 0, 'eval_batch_limit': config.alpha_eval_batches})
+        alpha_scheduler_cfg={'warmup_updates': 0, 'eval_batch_limit': config.alpha_eval_batches,
+            'sampling_policy':config.alpha_sampling_policy, 'pool_ratio':config.alpha_pool_ratio,
+            'update_ratio':config.alpha_update_ratio, 'align_power_of_two':config.alpha_align_power_of_two})
     optimizer.phi_pruning_mode = config.pruning_mode
     log_stage(args.output,'4/6 剪枝','开始完整 CRIC 流程，候选比例不等于参数减少比例。',**{'parameters': before_count,
                       'prunable_parameter_groups': len(optimizer.prunable_param_group_dict),
